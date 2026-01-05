@@ -13,6 +13,7 @@ seaborn
 # === LLM APIs ===
 anthropic
 google-genai
+google.generativeai
 
 # === E2B Sandbox ===
 e2b
@@ -48,5 +49,6 @@ gunicorn
 watchdog
 boto3
 botocore
+
 
 
