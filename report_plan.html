@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html lang='fr'>
+<head>
+    <meta charset='UTF-8'>
+    <meta name='viewport' content='width=device-width, initial-scale=1.0'>
+    <title>Rapport d'Analyse Descriptive Préliminaire d'un Jeu de Données Individuel</title>
+    <style>
+        body { font-family: Arial, sans-serif; max-width: 900px; margin: 40px auto; padding: 0 20px; line-height: 1.6; }
+        h1 { color: #2c3e50; border-bottom: 3px solid #3498db; padding-bottom: 10px; }
+        h2 { color: #34495e; margin-top: 30px; border-left: 4px solid #3498db; padding-left: 15px; }
+        h3 { color: #7f8c8d; margin-left: 20px; }
+        ul { margin-left: 40px; }
+        li { margin: 5px 0; }
+        .toc { background: #ecf0f1; padding: 20px; border-radius: 5px; margin: 20px 0; }
+        .timestamp { color: #95a5a6; font-style: italic; }
+    </style>
+</head>
+<body>
+    <h1>Rapport d'Analyse Descriptive Préliminaire d'un Jeu de Données Individuel</h1>
+    <p class='timestamp'>Plan généré le 22/12/2025 à 20:58</p>
+    <div class='toc'>
+        <h2>Table des matières</h2>
+        <ul>
+            <li><a href='#chap1'>1. Introduction</a>
+                <ul>
+                    <li>1.1. Contexte et objectifs de l'analyse</li>
+                    <li>1.2. Présentation et qualité des données</li>
+                </ul>
+            </li>
+            <li><a href='#chap2'>2. Analyse descriptive des variables</a>
+                <ul>
+                    <li>2.1. Statistiques univariées</li>
+                    <li>2.2. Statistiques bivariées et relations entre variables</li>
+                </ul>
+            </li>
+            <li><a href='#chap3'>3. Visualisations des données</a>
+                <ul>
+                    <li>3.1. Visualisations univariées</li>
+                    <li>3.2. Visualisations bivariées et multivariées</li>
+                </ul>
+            </li>
+            <li><a href='#chap4'>4. Conclusion et perspectives</a>
+                <ul>
+                    <li>4.1. Synthèse des principaux résultats et observations</li>
+                    <li>4.2. Recommandations et pistes d'approfondissement</li>
+                </ul>
+            </li>
+            <li><a href='#chap5'>5. Analyse des déterminants de l augmentation des salaires</a>
+                <ul>
+                    <li>5.1. Section à définir</li>
+                </ul>
+            </li>
+        </ul>
+    </div>
+    <h2 id='chap1'>Chapitre 1 : Introduction</h2>
+    <h3>1.1. Contexte et objectifs de l'analyse</h3>
+    <p><strong>Analyses prévues :</strong></p>
+    <ul>
+        <li>Présentation du contexte général des données analysées (par exemple, données d'individus avec leurs caractéristiques socio-économiques et géographiques)</li>
+        <li>Définition des objectifs principaux de l'analyse descriptive (comprendre la structure, les caractéristiques centrales, la variabilité et les relations initiales au sein du dataset)</li>
+    </ul>
+    <h3>1.2. Présentation et qualité des données</h3>
+    <p><strong>Analyses prévues :</strong></p>
+    <ul>
+        <li>Description de la source et du format des données (CSV fourni)</li>
+        <li>Vue d'ensemble du jeu de données (nombre de lignes: 6, nombre de colonnes: 4)</li>
+        <li>Définition et typologie des variables présentes: 'nom' (catégorielle unique/identifiant), 'age' (numérique), 'salaire' (numérique), 'ville' (catégorielle)</li>
+        <li>Évaluation de la qualité des données: Confirmation de l'absence totale de valeurs manquantes, discussion des implications de la taille très réduite du dataset (6 observations)</li>
+    </ul>
+    <h2 id='chap2'>Chapitre 2 : Analyse descriptive des variables</h2>
+    <h3>2.1. Statistiques univariées</h3>
+    <p><strong>Analyses prévues :</strong></p>
+    <ul>
+        <li>Analyse de la variable numérique 'age': Calcul de la moyenne, médiane, écart-type, variance, minimum, maximum, étendue, ainsi que des mesures de forme de distribution (asymétrie, aplatissement)</li>
+        <li>Analyse de la variable numérique 'salaire': Calcul de la moyenne, médiane, écart-type, variance, minimum, maximum, étendue, ainsi que des mesures de forme de distribution (asymétrie, aplatissement)</li>
+        <li>Analyse de la variable catégorielle 'nom': Dénombrement des valeurs uniques (6), confirmation de l'unicité de chaque nom et son rôle d'identifiant individuel</li>
+        <li>Analyse de la variable catégorielle 'ville': Calcul des fréquences absolues et relatives des différentes modalités, identification du nombre de villes uniques (4) et des villes les plus représentées</li>
+    </ul>
+    <h3>2.2. Statistiques bivariées et relations entre variables</h3>
+    <p><strong>Analyses prévues :</strong></p>
+    <ul>
+        <li>Analyse de la relation entre les variables numériques 'age' et 'salaire': Calcul et interprétation du coefficient de corrélation de Pearson</li>
+        <li>Analyse de la relation entre 'age' et 'ville': Comparaison des moyennes et médianes d'âge par groupe de villes (par exemple, tests paramétriques comme l'ANOVA ou non-paramétriques comme Kruskal-Wallis si les conditions sont minimalement remplies, ou simple description comparative)</li>
+        <li>Analyse de la relation entre 'salaire' et 'ville': Comparaison des moyennes et médianes de salaire par groupe de villes (par exemple, tests paramétriques comme l'ANOVA ou non-paramétriques comme Kruskal-Wallis si les conditions sont minimalement remplies, ou simple description comparative)</li>
+        <li>Analyse des caractéristiques ('age', 'salaire') par 'nom' (approche descriptive individuelle, puisque 'nom' est un identifiant unique)</li>
+    </ul>
+    <h2 id='chap3'>Chapitre 3 : Visualisations des données</h2>
+    <h3>3.1. Visualisations univariées</h3>
+    <p><strong>Analyses prévues :</strong></p>
+    <ul>
+        <li>Histogramme et Boxplot de la variable 'age' pour visualiser sa distribution, sa concentration et identifier d'éventuels outliers (si présents malgré le faible effectif)</li>
+        <li>Histogramme et Boxplot de la variable 'salaire' pour visualiser sa distribution, sa concentration et identifier d'éventuels outliers</li>
+        <li>Diagramme en barres des fréquences de la variable 'ville' pour illustrer la répartition géographique des individus dans l'échantillon</li>
+        <li>Tableau de synthèse des individus ('nom') avec leurs 'age', 'salaire' et 'ville' respectifs (plus pertinent qu'un graphique pour 'nom')</li>
+    </ul>
+    <h3>3.2. Visualisations bivariées et multivariées</h3>
+    <p><strong>Analyses prévues :</strong></p>
+    <ul>
+        <li>Nuage de points (scatterplot) entre 'age' et 'salaire' pour explorer visuellement la nature et la force de leur relation, potentiellement avec l'ajout d'une droite de régression linéaire</li>
+        <li>Boxplots ou diagrammes en violon des salaires groupés par 'ville' pour visualiser les différences de rémunération selon la localisation géographique</li>
+        <li>Boxplots ou diagrammes en violon des âges groupés par 'ville' pour visualiser les différences d'âge selon la localisation géographique</li>
+        <li>Graphiques comparatifs des attributs ('age', 'salaire') pour chaque individu ('nom') (par exemple, un graphique à barres groupées pour les valeurs individuelles)</li>
+    </ul>
+    <h2 id='chap4'>Chapitre 4 : Conclusion et perspectives</h2>
+    <h3>4.1. Synthèse des principaux résultats et observations</h3>
+    <p><strong>Analyses prévues :</strong></p>
+    <ul>
+        <li>Récapitulatif des caractéristiques démographiques et salariales des individus étudiés</li>
+        <li>Mise en évidence des relations ou tendances observées entre l'âge, le salaire et la ville</li>
+        <li>Discussion des limites de l'étude, notamment dues à la taille très restreinte de l'échantillon et aux implications pour la généralisation des résultats</li>
+    </ul>
+    <h3>4.2. Recommandations et pistes d'approfondissement</h3>
+    <p><strong>Analyses prévues :</strong></p>
+    <ul>
+        <li>Suggestions pour l'enrichissement futur du dataset (augmentation significative du nombre d'observations, ajout de nouvelles variables pertinentes comme le sexe, le niveau d'éducation, le secteur d'activité)</li>
+        <li>Pistes pour des analyses statistiques plus avancées si le volume de données augmentait (modélisation prédictive, analyse de clusters, inférence statistique)</li>
+        <li>Pistes détaillées pour la modélisation prédictive (conditionnées par un enrichissement significatif des données) :</li>
+        <li>Définition des objectifs de prédiction (par exemple, prédire le salaire ou la ville) et identification des variables cibles et explicatives potentielles.</li>
+        <li>Sélection de modèles prédictifs appropriés, tels que la régression linéaire, les arbres de décision ou les forêts aléatoires pour une cible numérique, ou la classification pour une cible catégorielle.</li>
+        <li>Mise en place de techniques de validation des modèles (par exemple, validation croisée) et évaluation de leurs performances à l'aide de métriques pertinentes (par exemple, R², MSE, MAE pour la régression ; précision, rappel, F1-score pour la classification).</li>
+        <li>Analyse de l'importance des variables dans les modèles prédictifs et interprétation des résultats pour en tirer des conclusions prospectives ou des facteurs influents.</li>
+        <li>Implications potentielles des résultats préliminaires pour la prise de décision ou des études de cas approfondies</li>
+    </ul>
+    <h2 id='chap5'>Chapitre 5 : Analyse des déterminants de l augmentation des salaires</h2>
+    <h3>5.1. Section à définir</h3>
+    <p><strong>Analyses prévues :</strong></p>
+    <ul>
+        <li>Analyse à détailler</li>
+    </ul>
+</body>
+</html>

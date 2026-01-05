@@ -1,0 +1,32 @@
+{
+  "nb_chapitres": 5,
+  "nb_sections": 9,
+  "nb_analyses": 34,
+  "detail_par_chapitre": [
+    {
+      "titre": "Introduction",
+      "sections": 2,
+      "analyses": 6
+    },
+    {
+      "titre": "Analyse descriptive des variables",
+      "sections": 2,
+      "analyses": 8
+    },
+    {
+      "titre": "Visualisations des données",
+      "sections": 2,
+      "analyses": 8
+    },
+    {
+      "titre": "Conclusion et perspectives",
+      "sections": 2,
+      "analyses": 11
+    },
+    {
+      "titre": "Analyse des déterminants de l augmentation des salaires",
+      "sections": 1,
+      "analyses": 1
+    }
+  ]
+}

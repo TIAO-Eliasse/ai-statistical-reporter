@@ -1,0 +1,2003 @@
+"""
+Chapter-by-Chapter Report Generator
+Génère un rapport complet chapitre par chapitre avec validation humaine
+VERSION CORRIGÉE ET AMÉLIORÉE - Décembre 2025
+
+CORRECTIONS MAJEURES :
+[OK] Gestion robuste des erreurs Python (KeyError, TypeError)
+[OK] Décodage des variables encodées
+[OK] Interprétations obligatoires après CHAQUE tableau/graphique
+[OK] Références correctes (tableau vs graphique)
+[OK] Support Excel + CSV
+[OK] Gestion apostrophes dans noms de colonnes
+"""
+
+from typing import Dict, List, Optional
+from enum import Enum
+import logging
+from datetime import datetime
+
+# Imports des modules précédents
+from e2b_session_manager import get_sandbox_for_user, execute_python_code
+from contextual_memory import (
+    add_chapter_to_memory,
+    get_context_for_chapter,
+    contextual_memory
+)
+from table_formatter import TableFormatter
+
+logger = logging.getLogger(__name__)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# MODULE AUTO-REVIEW INTÉGRÉ v2.5 - Powered by Gemini 2.0 Flash
+# ═══════════════════════════════════════════════════════════════════════════════
+
+REVIEW_PROMPT = """Tu es un statisticien senior et reviewer professionnel.
+
+[SEARCH] ANALYSE : Crédibilité statistique, qualité analytique, lisibilité professionnelle
+🛠️ PRODUIS : 1️⃣ Critique 2️⃣ Améliorations 3️⃣ Recommandations prompts 4️⃣ Principes
+
+RAPPORT : {report_content}
+"""
+
+
+def auto_review_report(report_markdown: str) -> dict:
+    """Auto-review du rapport avec Gemini 2.0 Flash"""
+    try:
+        import google.generativeai as genai
+        import os
+        
+        # Configurer Gemini
+        api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+        if not api_key:
+            return {'success': False, 'error': 'GEMINI_API_KEY ou GOOGLE_API_KEY non trouvée'}
+        
+        genai.configure(api_key=api_key)
+        
+        # Utiliser Gemini 2.0 Flash
+        model = genai.GenerativeModel('gemini-2.0-flash-exp')
+        
+        logger.info("Lancement auto-review avec Gemini 2.0 Flash...")
+        
+        # Générer la review
+        prompt = REVIEW_PROMPT.format(report_content=report_markdown[:50000])
+        response = model.generate_content(prompt)
+        
+        review_text = response.text
+        logger.info("Auto-review terminée")
+        
+        # Parser sections
+        sections = {}
+        for emoji, key in [("1️⃣", "critique"), ("2️⃣", "ameliorations"), 
+                            ("3️⃣", "prompt_recommendations"), ("4️⃣", "principles")]:
+            if emoji in review_text:
+                start = review_text.find(emoji)
+                next_emoji = ["2️⃣", "3️⃣", "4️⃣", None]
+                next_idx = ["2️⃣", "3️⃣", "4️⃣", None].index(None) if emoji == "4️⃣" else ["1️⃣", "2️⃣", "3️⃣", "4️⃣"].index(emoji) + 1
+                end = review_text.find(next_emoji[next_idx]) if next_idx < 4 and next_emoji[next_idx] else len(review_text)
+                sections[key] = review_text[start:end].strip()
+        
+        return {'success': True, 'full_review': review_text, **sections}
+    except Exception as e:
+        logger.error(f"Auto-review error: {e}")
+        return {'success': False, 'error': str(e)}
+
+
+
+def validate_no_consecutive_visuals(markdown_text: str) -> dict:
+    """
+    Valide qu'il n'y a PAS 2 graphiques/tableaux consécutifs sans texte
+    
+    Returns:
+        dict avec 'valid' (bool) et 'violations' (list)
+    """
+    lines = markdown_text.split('\n')
+    violations = []
+    
+    i = 0
+    while i < len(lines):
+        line = lines[i].strip()
+        
+        # Détecter graphique/tableau
+        is_visual = (
+            line.startswith('**Graphique') or 
+            line.startswith('**Tableau') or
+            line.startswith('![') or
+            '|' in line and i > 0 and '|' in lines[i-1]
+        )
+        
+        if is_visual:
+            # Chercher prochain élément visuel
+            j = i + 1
+            text_between = []
+            
+            while j < len(lines):
+                next_line = lines[j].strip()
+                
+                # Prochain visuel trouvé ?
+                next_is_visual = (
+                    next_line.startswith('**Graphique') or 
+                    next_line.startswith('**Tableau') or
+                    next_line.startswith('![')
+                )
+                
+                if next_is_visual:
+                    # Vérifier s'il y a du texte substantiel entre
+                    text_content = ' '.join(text_between)
+                    word_count = len([w for w in text_content.split() if len(w) > 2])
+                    
+                    if word_count < 20:  # Moins de 20 mots = pas d'interprétation
+                        violations.append({
+                            'line': i + 1,
+                            'type': 'consecutive_visuals',
+                            'message': f'Graphique/Tableau ligne {i+1} suivi immédiatement par ligne {j+1} sans interprétation (seulement {word_count} mots)',
+                            'context': f"{line[:50]}... → {next_line[:50]}..."
+                        })
+                    break
+                
+                # Accumuler texte
+                if next_line and not next_line.startswith('#'):
+                    text_between.append(next_line)
+                
+                j += 1
+        
+        i += 1
+    
+    return {
+        'valid': len(violations) == 0,
+        'violations': violations,
+        'count': len(violations)
+    }
+
+
+def fix_consecutive_visuals(markdown_text: str) -> str:
+    """
+    Corrige automatiquement les graphiques/tableaux consécutifs
+    en ajoutant des interprétations placeholder
+    """
+    lines = markdown_text.split('\n')
+    fixed_lines = []
+    
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        fixed_lines.append(line)
+        
+        # Détecter graphique/tableau
+        is_visual = (
+            line.strip().startswith('**Graphique') or 
+            line.strip().startswith('**Tableau')
+        )
+        
+        if is_visual:
+            # Chercher prochain visuel
+            j = i + 1
+            has_text = False
+            
+            while j < len(lines) and j < i + 10:  # Chercher dans les 10 lignes suivantes
+                next_line = lines[j].strip()
+                
+                if next_line.startswith('**Graphique') or next_line.startswith('**Tableau'):
+                    # Prochain visuel trouvé sans texte
+                    if not has_text:
+                        # Insérer interprétation placeholder (PROSE NATURELLE)
+                        fixed_lines.append('')
+                        fixed_lines.append('[À compléter : Ajouter ici 2-3 paragraphes d'analyse professionnelle de cette visualisation, sans titre "Interprétation". Décrire les observations principales, les implications, et le contexte. Minimum 50 mots en prose naturelle.]')
+                        fixed_lines.append('')
+                        logger.warning(f"Auto-fix: Analyse placeholder ajoutée après ligne {i+1}")
+                    break
+                
+                # Vérifier présence texte substantiel
+                if len(next_line) > 20 and not next_line.startswith('#'):
+                    has_text = True
+                    break
+                
+                j += 1
+        
+        i += 1
+    
+    return '\n'.join(fixed_lines)
+
+\n\nclass ChapterStatus(Enum):
+    """Statuts possibles d'un chapitre"""
+    PENDING = "En attente"
+    GENERATING = "Génération en cours"
+    GENERATED = "Généré (en attente validation)"
+    VALIDATED = "Validé"
+    REJECTED = "Rejeté (à regénérer)"
+    ERROR = "Erreur"
+
+
+class Chapter:
+    """Représente un chapitre du rapport"""
+    
+    def __init__(self, number: str, title: str, sections: List[Dict]):
+        self.number = number
+        self.title = title
+        self.sections = sections
+        self.status = ChapterStatus.PENDING
+        self.content: Optional[str] = None
+        self.generated_at: Optional[datetime] = None
+        self.validated_at: Optional[datetime] = None
+        self.error_message: Optional[str] = None
+        self.attempts = 0
+        self.regeneration_instructions: Optional[Dict] = None
+    
+    def to_dict(self) -> dict:
+        return {
+            'number': self.number,
+            'title': self.title,
+            'sections': self.sections,
+            'status': self.status.value,
+            'content': self.content,
+            'generated_at': self.generated_at.isoformat() if self.generated_at else None,
+            'validated_at': self.validated_at.isoformat() if self.validated_at else None,
+            'error_message': self.error_message,
+            'attempts': self.attempts,
+            'regeneration_instructions': self.regeneration_instructions
+        }
+
+
+
+class ReportGenerationWorkflow:
+    """
+    Workflow de génération de rapport avec validation humaine
+    
+    Process:
+    1. Charger le plan du rapport
+    2. Pour chaque chapitre:
+       a. Générer le chapitre (IA + E2B)
+       b. Afficher à l'utilisateur
+       c. Attendre validation
+       d. Si validé: passer au suivant
+       e. Si rejeté: regénérer
+    3. Compiler tous les chapitres en rapport final
+    """
+    
+    def __init__(self, user_id: str, plan: Dict, csv_path: str, cost_controller=None, study_context=None):
+        self.user_id = user_id
+        self.plan = plan
+        self.csv_path = csv_path
+        self.cost_controller = cost_controller
+        self.study_context = study_context
+        self.chapters: List[Chapter] = []
+        self.current_chapter_index = 0
+        
+        # Initialiser les chapitres depuis le plan
+        self._initialize_chapters()
+        
+        # Charger la mémoire contextuelle
+        contextual_memory.load_memory(user_id)
+        
+        logger.info(f"Workflow initialized for user {user_id}: {len(self.chapters)} chapters")
+        
+        if cost_controller:
+            logger.info(f"Cost controller enabled - Total target: {cost_controller.get_total_pages()} pages")
+        
+        if study_context:
+            logger.info(f"Study context available: {study_context.study_title or 'Untitled'}")
+    
+    def _initialize_chapters(self):
+        """Initialise la liste des chapitres depuis le plan"""
+        for chapter_data in self.plan.get('chapitres', []):
+            chapter = Chapter(
+                number=chapter_data['numero'],
+                title=chapter_data['titre'],
+                sections=chapter_data.get('sections', [])
+            )
+            self.chapters.append(chapter)
+    
+    def get_current_chapter(self) -> Optional[Chapter]:
+        """Retourne le chapitre en cours de traitement"""
+        if self.current_chapter_index < len(self.chapters):
+            return self.chapters[self.current_chapter_index]
+        return None
+    
+    def generate_current_chapter(self) -> Dict:
+        """
+        Génère le chapitre en cours
+        
+        Returns:
+            {
+                'success': bool,
+                'chapter': Chapter,
+                'content': str (si success),
+                'error': str (si échec)
+            }
+        """
+        chapter = self.get_current_chapter()
+        
+        if not chapter:
+            return {
+                'success': False,
+                'chapter': None,
+                'error': "Aucun chapitre à générer"
+            }
+        
+        logger.info(f"Generating chapter {chapter.number}: {chapter.title}")
+        
+        chapter.status = ChapterStatus.GENERATING
+        chapter.attempts += 1
+        
+        try:
+            # 1. Récupérer le contexte des chapitres précédents
+            context = get_context_for_chapter(self.user_id, chapter.number)
+            
+            # 2. Construire le prompt pour l'IA (avec instructions de régénération si disponibles)
+            prompt = self._build_chapter_prompt(chapter, context)
+            
+            # 3. Déterminer le type de tâche selon le chapitre
+            task_type = self._detect_task_type(chapter)
+            logger.info(f"Detected task type for chapter {chapter.number}: {task_type}")
+            
+            # 4. Générer le contenu avec l'IA (modèle spécialisé)
+            content = self._generate_with_ai(prompt, task_type=task_type)
+            
+            # 5. Exécuter le code Python dans E2B si nécessaire
+            content_with_results = self._execute_code_blocks(content)
+            
+            # 6. Mettre à jour le chapitre
+            chapter.content = content_with_results
+            chapter.status = ChapterStatus.GENERATED
+            chapter.generated_at = datetime.now()
+            
+            logger.info(f"Chapter {chapter.number} generated successfully ({len(content_with_results)} chars)")
+            
+            return {
+                'success': True,
+                'chapter': chapter,
+                'content': content_with_results
+            }
+        
+        except Exception as e:
+            import traceback
+            full_traceback = traceback.format_exc()
+            logger.error(f"Failed to generate chapter {chapter.number}: {e}")
+            logger.error(f"FULL TRACEBACK:\n{full_traceback}")
+            
+            chapter.status = ChapterStatus.ERROR
+            chapter.error_message = str(e)
+            
+            return {
+                'success': False,
+                'chapter': chapter,
+                'error': str(e)
+            }
+    
+    def _detect_task_type(self, chapter: Chapter) -> str:
+        """
+        Détecte le type de tâche selon le numéro et titre du chapitre
+        
+        Returns:
+            "code", "writing", "analysis", "plan", ou "default"
+        """
+        title_lower = chapter.title.lower()
+        
+        # Chapitres nécessitant beaucoup de code/graphiques
+        if any(keyword in title_lower for keyword in [
+            "présentation", "description", "distribution", "visualisation"
+        ]):
+            return "code"
+        
+        # Chapitres d'analyse/interprétation
+        elif any(keyword in title_lower for keyword in [
+            "analyse", "relation", "corrélation", "test", "interprétation", 
+            "comparaison", "différence"
+        ]):
+            return "analysis"
+        
+        # Chapitres de conclusion/synthèse
+        elif any(keyword in title_lower for keyword in [
+            "conclusion", "synthèse", "recommandation", "discussion"
+        ]):
+            return "writing"
+        
+        # Introduction (mix de writing et code)
+        elif "introduction" in title_lower:
+            return "writing"
+        
+        # Par défaut
+        else:
+            return "default"
+    
+    def _build_chapter_prompt(self, chapter: Chapter, context: str) -> str:
+        """
+        Construit le prompt pour générer un chapitre
+        VERSION ULTRA-ORGANISÉE - Structure hiérarchique claire
+        """
+        
+        # ═══════════════════════════════════════════════════════════════
+        # COLLECTE DES INFORMATIONS (comme dans l'original)
+        # ═══════════════════════════════════════════════════════════════
+        
+        csv_columns_info = ""
+        try:
+            import pandas as pd
+            import os
+            
+            file_extension = os.path.splitext(self.csv_path)[1].lower()
+            
+            if file_extension in ['.xlsx', '.xls']:
+                df_temp = pd.read_excel(self.csv_path)
+                file_type_label = "EXCEL"
+            else:
+                df_temp = pd.read_csv(self.csv_path)
+                file_type_label = "CSV"
+            
+            columns_list = df_temp.columns.tolist()
+            columns_types = df_temp.dtypes.to_dict()
+            
+            # Construction des infos colonnes
+            csv_columns_info = f"""
+    📁 FICHIER {file_type_label} : {len(df_temp)} lignes
+
+    COLONNES DISPONIBLES (utilisez SEULEMENT celles-ci) :
+    """
+            for col in columns_list[:20]:  # Limiter affichage
+                dtype = str(columns_types[col])
+                example = str(df_temp[col].iloc[0]) if len(df_temp) > 0 else "N/A"
+                csv_columns_info += f"  • \"{col}\" ({dtype}, ex: {example})\n"
+            
+            if len(columns_list) > 20:
+                csv_columns_info += f"  • ... et {len(columns_list) - 20} autres colonnes\n"
+            
+        except Exception as e:
+            logger.error(f"Failed to read data: {e}")
+            csv_columns_info = "[WARNING] Impossible de lire les colonnes du fichier.\n"
+        
+        # Récupérer contraintes de longueur
+        length_guidelines = ""
+        if self.cost_controller:
+            try:
+                from cost_controller import get_length_guidelines
+                config = self.cost_controller.get_chapter_config(chapter.number)
+                if config:
+                    length_guidelines = f"\n📏 LONGUEUR CIBLE : {config.target_pages} pages (~{config.target_words} mots)\n"
+            except Exception as e:
+                logger.warning(f"Failed to get length guidelines: {e}")
+
+        study_context_section = ""
+                
+        writing_style_block = ""
+
+        if self.study_context:
+            try:
+                # Contexte de l'étude
+                study_context_section = f"""
+        {self.study_context.to_prompt_context()}
+
+        [WARNING] IMPORTANT : Utilisez ce contexte pour guider TOUTE votre analyse !
+        - Répondez à la question de recherche
+        - Testez les hypothèses formulées
+        - Atteignez les objectifs définis
+        - Adaptez le style au public cible
+
+        """
+                
+                # NOUVEAU : Bloc de style d'écriture selon le profil
+                try:
+                    writing_style_block = self.study_context.get_writing_style_block()
+                    logger.info(f"Chapter {chapter.number}: Writing profile {self.study_context.writing_profile.value} injected")
+                except Exception as e:
+                    logger.warning(f"Failed to inject writing style: {e}")
+                    writing_style_block = ""
+                
+                logger.info(f"Chapter {chapter.number}: Study context injected")
+            
+            except Exception as e:
+                logger.warning(f"Failed to inject study context: {e}")
+        # Instructions de régénération
+        regeneration_instructions = ""
+        if hasattr(chapter, 'regeneration_instructions') and chapter.regeneration_instructions:
+            instructions = chapter.regeneration_instructions
+            regeneration_instructions = f"""
+    [REFRESH] RÉGÉNÉRATION DEMANDÉE : {instructions.get('request', '')}
+    {"[OK] Conserver structure" if instructions.get('keep_structure') else "🆕 Modifier si nécessaire"}
+    """
+        elif chapter.status == ChapterStatus.REJECTED and chapter.error_message:
+            regeneration_instructions = f"\n[REFRESH] RAISON DU REJET : {chapter.error_message}\n"
+        
+        # ═══════════════════════════════════════════════════════════════
+        # CONSTRUCTION DU PROMPT HIÉRARCHISÉ
+        # ═══════════════════════════════════════════════════════════════
+        
+        prompt = f"""
+    ╔══════════════════════════════════════════════════════════════════════════════╗
+    ║                                                                              ║
+    ║         GÉNÉRATION CHAPITRE {chapter.number} : {chapter.title}                              ║
+    ║                                                                              ║
+    ╚══════════════════════════════════════════════════════════════════════════════╝
+
+
+    ╔══════════════════════════════════════════════════════════════════════════════╗
+    ║ SECTION 1 : DONNÉES & CONTEXTE DISPONIBLES                                  ║
+    ╚══════════════════════════════════════════════════════════════════════════════╝
+
+    {csv_columns_info}
+
+    {context}
+
+    {study_context_section}
+    {writing_style_block}
+    {regeneration_instructions}
+
+    {length_guidelines}
+
+
+    ╔══════════════════════════════════════════════════════════════════════════════╗
+    ║ SECTION 2 : VOTRE MISSION                                                   ║
+    ╚══════════════════════════════════════════════════════════════════════════════╝
+
+    [WARNING] RÈGLE ULTRA-IMPORTANTE : LE CODE NE DOIT PAS APPARAÎTRE DANS LE RAPPORT !
+
+    🔴 FONCTIONNEMENT DU SYSTÈME :
+    1. Tu écris le code entre ```python et ```
+    2. Le système l'EXÉCUTE automatiquement dans E2B
+    3. Le CODE est SUPPRIMÉ du rapport final
+    4. Seuls les RÉSULTATS (tableaux, graphiques, print) apparaissent
+    🔴 PRINCIPE DE NON-RÉPÉTITION :
+    - Une fois qu'un résultat est affiché (tableau/graphique), NE PAS le régénérer
+    - Si vous devez ajuster, utilisez les données déjà calculées
+    - Exemple :
+    
+    [OK] CORRECT :
+````
+    [Code 1 → Tableau 1.1]
+    afficher tableau
+    le code ne doit jamais etre afficher dans le rapport
+    Interprétation...
+    
+    [Code 2 → Tableau 1.2 - NOUVEAU résultat]
+    afficher tableau
+    Interprétation...
+    [Code 3 → graphique 1.1 - NOUVEAU résultat]
+    toujours afficher graphique 
+    
+    Interpretertation...
+````
+    
+    [ERROR] INTERDIT :
+````
+    [Code 1 → Tableau 1.1]
+    [Code 1 BIS (même chose) → Tableau 1.1 dupliqué]
+    le code ne doit jamais etre afficher dans le rapport
+````
+    [ERROR] CE QUI APPARAÎT ACTUELLEMENT (ERREUR) :
+    le code ne doit jamais etre afficher dans le rapport
+    ```
+    ### 2.1. Analyse
+
+    ```python
+    import pandas as pd
+    chapitre = 2
+    # ... code ...
+    ```
+
+    **Tableau 2.1 : Résultats**
+    ```
+
+    [OK] CE QUI DOIT APPARAÎTRE (CORRECT) :
+    ```
+    ### 2.1. Analyse
+
+    **Tableau 2.1 : Résultats**
+
+    | Variable | Valeur |
+    |----------|--------|
+    | CA 2015  | 92774  |
+
+    L'analyse révèle...
+    ```
+
+    🔴 DONC :
+    - N'écris JAMAIS "Voici le code Python..." ou "Le code suivant..."
+    - N'explique PAS ton code avant de l'écrire
+    - Écris DIRECTEMENT le code, il sera exécuté et supprimé
+    - Seuls les print() et plt.show() généreront du contenu visible
+
+    📋 SECTIONS À COUVRIR :
+
+    """
+        
+        # Ajouter sections à couvrir
+        for i, section in enumerate(chapter.sections, 1):
+            prompt += f"""
+    {chapter.number}.{i}. {section['titre']}
+    Analyses : {', '.join(section['analyses'])}
+
+    """
+        
+        prompt += f"""
+
+    📌 FORMAT ATTENDU :
+    - Structure Markdown (## pour chapitre, ### pour sections)
+    - Commencer par : ## {chapter.number}. {chapter.title}
+    - Ton académique mais accessible
+    - Chiffres précis + interprétation
+
+
+    ╔══════════════════════════════════════════════════════════════════════════════╗
+    ║ SECTION 3 : TOP 10 RÈGLES CRITIQUES (PAR ORDRE D'IMPORTANCE)                ║
+    ╚══════════════════════════════════════════════════════════════════════════════╝
+
+    Lisez TOUTES ces règles avant de commencer. Elles sont classées par importance.
+    ┌────────────────────────────────────────────────────────────────────────┐
+    │ 🔴 RÈGLE #0 : CODE = INVISIBLE (LA RÈGLE SUPRÊME)                      │
+    └────────────────────────────────────────────────────────────────────────┘
+
+    🎯 PRINCIPE FONDAMENTAL :
+    Le lecteur du rapport NE DOIT JAMAIS voir de code Python.
+    Le code est un OUTIL D'ANALYSE, pas du contenu de rapport.
+
+    [ERROR] CE QUI NE DOIT JAMAIS APPARAÎTRE DANS LE RAPPORT :
+````python
+    import pandas as pd
+    df = pd.read_excel(...)
+    # ... tout code Python ...
+````
+
+    [OK] CE QUI DOIT APPARAÎTRE :
+    - Les tableaux de résultats
+    - Les graphiques
+    - Les interprétations en prose
+    - Les insights business
+
+    🔧 COMMENT ÇA MARCHE :
+    1. Vous écrivez le code entre ```python et ```
+    2. Le système l'EXÉCUTE dans un sandbox
+    3. Le système SUPPRIME le code du rapport
+    4. Le système GARDE uniquement les résultats (print, graphiques)
+
+    [WARNING] DONC :
+    - N'expliquez JAMAIS votre code au lecteur
+    - Ne dites JAMAIS "Voici le code..." ou "Le code suivant..."
+    - Écrivez comme si le code n'existait pas pour le lecteur
+    - Seuls les RÉSULTATS comptent
+
+    📖 STYLE D'ÉCRITURE CORRECT :
+````
+    L'analyse de la structure de financement révèle des insights clés.
+
+    **Tableau 1.1 : Corrélation Fonds Propres - CA 2015**
+    
+    | Variable 1 | Variable 2 | Corrélation |
+    |------------|------------|-------------|
+    | Fonds propres | CA 2015 | 0.04 |
+
+    Cette faible corrélation (0.04) suggère que...
+````
+
+    [ERROR] CE QU'IL NE FAUT PAS ÉCRIRE :
+    ┌──────────────────────────────────────────────────────────────────────────────┐
+    │ 🔴 RÈGLE #1 : INITIALISATION OBLIGATOIRE (LA PLUS IMPORTANTE)               │
+    └──────────────────────────────────────────────────────────────────────────────┘
+
+    [WARNING] FORMAT STRICT DES BALISES DE CODE :
+
+    TOUJOURS utiliser ce format EXACT :
+    ```python
+    [votre code ici]
+    ```
+
+    [ERROR] FORMATS INTERDITS :
+    ~~~python  (tildes)
+    ```py      (abréviation)
+    `python    (simple backtick)
+
+    [OK] FORMAT OBLIGATOIRE :
+    ```python
+    import pandas as pd
+    ...
+    ```
+
+    CHAQUE bloc ```python``` DOIT commencer par :
+
+    ```python
+    import pandas as pd
+    import numpy as np
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+
+    chapitre = {chapter.number}
+    tableau_counter = 1
+    figure_counter = 1
+
+    plt.style.use('seaborn-v0_8-darkgrid')
+    sns.set_palette("husl")
+    ```
+
+    [ERROR] SANS CE BLOC → NameError: name 'chapitre' is not defined
+    [OK] TOUJOURS copier ce bloc au début de CHAQUE code
+    ┌────────────────────────────────────────────────────────────────────────┐
+    │ 🔴 RÈGLE #1.5 : PAS DE CONFIGURATION E2B DANS LE CODE                  │
+    └────────────────────────────────────────────────────────────────────────┘
+
+    [WARNING] RÈGLE CRITIQUE : FORMAT DU CODE PYTHON
+    
+    [OK] CORRECT - Chaque bloc Python doit commencer ainsi:
+````python
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+
+# Votre code d'analyse ici
+````
+
+    [ERROR] INTERDIT ABSOLU:
+    - NE JAMAIS écrire: import os; os.environ[...]
+    - NE JAMAIS ajouter de configuration d'environnement
+    - NE JAMAIS mettre de code avant les imports
+
+    Le système gère automatiquement l'environnement d'exécution.
+    ┌──────────────────────────────────────────────────────────────────────────────┐
+    │ 🔴 RÈGLE #2 : INTERPRÉTATION IMMÉDIATE (CAUSE #1 DE REJET)                  │
+    └──────────────────────────────────────────────────────────────────────────────┘
+
+    ORDRE STRICT pour chaque analyse :
+    1️⃣ Introduction (1-2 phrases)
+    2️⃣ Code Python → Résultat
+    3️⃣ Interprétation (2-4 phrases en prose)
+    4️⃣ Transition (1 phrase)
+
+    [ERROR] INTERDIT : 2+ tableaux/graphiques sans interprétation entre eux
+    [OK] OBLIGATOIRE : 1 élément = 1 interprétation IMMÉDIATE
+
+    EXEMPLE CORRECT :
+    ```
+    Examinons la répartition géographique.
+
+    [Code → Tableau]
+
+    Les données révèlent une concentration dans le LITTORAL (37%)...
+    Cette prédominance reflète le dynamisme économique côtier.
+
+    Analysons maintenant le type d'entreprise.
+
+    [Code → Graphique]
+
+    Le graphique montre la dominance des TPE (49%)...
+    ```
+
+    ┌──────────────────────────────────────────────────────────────────────────────┐
+    │ 🔴 RÈGLE #3 : GUILLEMETS DANS LES F-STRINGS (CAUSE #1 D'ERREURS)            │
+    └──────────────────────────────────────────────────────────────────────────────┘
+
+    [ERROR] ERREUR FRÉQUENTE :
+    print(f"Analyse "Chiffre d'affaire"")  # SyntaxError !
+
+    [OK] SOLUTION :
+    print(f"Analyse 'Chiffre d\\'affaire'")  # Guillemets simples + échappement
+
+    📌 RÈGLE : F-string = " extérieur, ' intérieur
+
+    ┌──────────────────────────────────────────────────────────────────────────────┐
+    │ 🔴 RÈGLE #4 : TRY-EXCEPT OBLIGATOIRE (ZÉRO ERREUR DANS RAPPORT)             │
+    └──────────────────────────────────────────────────────────────────────────────┘
+
+    TOUT code graphique DOIT être dans try-except :
+
+    ```python
+    try:
+        # Graphique
+        fig, ax = plt.subplots()
+        # ... code ...
+        plt.show()
+        print(f"**Graphique {{chapitre}}.{{figure_counter}} : Titre**")
+        figure_counter += 1
+    except:
+        # Fallback tableau
+        print(f"**Tableau {{chapitre}}.{{tableau_counter}} : Données**")
+        # ... tableau simple ...
+        tableau_counter += 1
+    ```
+
+    [ERROR] INTERDIT : Afficher erreur dans le rapport
+    [OK] OBLIGATOIRE : Fallback pour CHAQUE graphique
+
+    ┌──────────────────────────────────────────────────────────────────────────────┐
+    │ 🔴 RÈGLE #5 : VARIABLES ENCODÉES (ERREUR FRÉQUENTE)                         │
+    └──────────────────────────────────────────────────────────────────────────────┘
+
+    AVANT calcul moyenne, VÉRIFIER :
+
+    ```python
+    if df['colonne'].nunique() < 10:
+        # Encodée → distribution seulement
+        print("Distribution :")
+        # ... fréquences ...
+    else:
+        # Continue → statistiques
+        print(f"Moyenne : {{df['colonne'].mean():.2f}}")
+    ```
+
+    [ERROR] ERREUR : Moyenne sur Age encodé (1,2,3) → "2.5 ans" absurde !
+    [OK] CORRECT : Vérifier d'abord
+
+    ┌──────────────────────────────────────────────────────────────────────────────┐
+    │ 🔴 RÈGLE #6 : NUMÉROTATION SYSTÉMATIQUE                                     │
+    └──────────────────────────────────────────────────────────────────────────────┘
+
+    Format : **Tableau/Graphique {{chapitre}}.{{counter}} : Titre**
+
+    ```python
+    print(f"**Tableau {{chapitre}}.{{tableau_counter}} : Titre**")
+    tableau_counter += 1
+    ```
+
+    [ERROR] INTERDIT : Oublier numérotation
+    [OK] OBLIGATOIRE : Numéro séquentiel
+
+    ┌──────────────────────────────────────────────────────────────────────────────┐
+    │ 🔴 RÈGLE #7 : ÉQUILIBRE TABLEAUX/GRAPHIQUES (40% GRAPHIQUES MIN)            │
+    └──────────────────────────────────────────────────────────────────────────────┘
+
+    CONVERSIONS OBLIGATOIRES :
+    - Distribution (>5 cat) → GRAPHIQUE barres
+    - Corrélations → HEATMAP
+    - Moyennes/groupe → GRAPHIQUE barres
+    - Évolutions → GRAPHIQUE ligne
+
+    [ERROR] INTERDIT : Chapitre avec que des tableaux
+    [OK] OBJECTIF : 40% minimum de graphiques
+
+    ┌──────────────────────────────────────────────────────────────────────────────┐
+    │ 🔴 RÈGLE #8 : APOSTROPHES & CARACTÈRES SPÉCIAUX                             │
+    └──────────────────────────────────────────────────────────────────────────────┘
+
+    Colonnes avec apostrophes :
+
+    [ERROR] ERREUR : cols = ['Nombre d'année']  # SyntaxError
+    [OK] SOLUTION 1 : cols = ["Nombre d'année"]  # Guillemets doubles
+    [OK] SOLUTION 2 : cols = ['Nombre d\\'année']  # Échapper
+
+    ┌──────────────────────────────────────────────────────────────────────────────┐
+    │ 🔴 RÈGLE #9 : CONVERSION FLOAT AVANT FORMATAGE                              │
+    └──────────────────────────────────────────────────────────────────────────────┘
+
+    TOUJOURS convertir Pandas → float :
+
+    [ERROR] ERREUR : print(f"Val : {{df.loc[0, 'col']:.2f}}")  # TypeError
+    [OK] CORRECT : val = float(df.loc[0, 'col'])
+                print(f"Val : {{val:.2f}}")
+
+    ┌──────────────────────────────────────────────────────────────────────────────┐
+    │ 🔴 RÈGLE #10 : ORDRE STRICT GRAPHIQUES                                      │
+    └──────────────────────────────────────────────────────────────────────────────┘
+
+    ORDRE NON-NÉGOCIABLE :
+    1️⃣ Code Python
+    2️⃣ plt.show()
+    3️⃣ print(f"**Graphique...**")  ← APRÈS plt.show() !
+    4️⃣ Interprétation
+
+    [ERROR] INTERDIT : Titre avant plt.show()
+    [OK] OBLIGATOIRE : Titre TOUJOURS après plt.show()
+
+    ┌──────────────────────────────────────────────────────────────────────────────┐
+    │ 🔴 RÈGLE #11 : JAMAIS DE TABLEAUX CONSÉCUTIFS (ULTRA-CRITIQUE)              │
+    └──────────────────────────────────────────────────────────────────────────────┘
+
+    [ERROR] INTERDIT ABSOLU :
+    ```
+    Tableau 2.1 : Stats Age
+    Tableau 2.2 : Stats Diplôme  ← SANS interprétation du 2.1 !
+    ```
+
+    [OK] OBLIGATOIRE :
+    ```
+    Tableau 2.1 : Stats Age
+
+    [INTERPRÉTATION IMMÉDIATE - minimum 2 phrases]
+    L'analyse révèle que... Les données montrent...
+
+    Tableau 2.2 : Stats Diplôme
+
+    [INTERPRÉTATION IMMÉDIATE - minimum 2 phrases]
+    On observe que... Cette distribution suggère...
+    ```
+
+    📌 RÈGLE D'OR : 1 tableau = 1 interprétation AVANT le tableau suivant
+
+    ┌──────────────────────────────────────────────────────────────────────────────┐
+    │ 🔴 RÈGLE #12 : VALEURS MANQUANTES OBLIGATOIRES (SI > 0%)                    │
+    └──────────────────────────────────────────────────────────────────────────────┘
+    Tous les codes sont des prompt que vous devez adaptez pour éviter des erreurs comme count is not define ou encore missing_count is not define
+    SI des valeurs manquantes existent, OBLIGATOIRE :
+
+    1️⃣ CRÉER une section dédiée : "Qualité des données"
+
+    2️⃣ ANALYSER CHAQUE variable avec valeurs manquantes :
+
+    ```python
+    # Identifier colonnes avec valeurs manquantes
+    missing = df.isnull().sum()
+    missing = missing[missing > 0].sort_values(ascending=False)
+
+    print(f"**Tableau {{chapitre}}.{{tableau_counter}} : Valeurs Manquantes**")
+    print()
+    print("| Variable | Nombre | % |")
+    print("|----------|--------|---|")
+    for col, count in missing.items():
+        pct = count / len(df) * 100
+        print(f"| {{{{col}}}} | {{{{missing_count}}}} | {{{{pct:.2f}}}}% |")
+    tableau_counter += 1
+    ```
+
+    3️⃣ INTERPRÉTER :
+    - Quelles variables ?
+    - Quel impact ?
+    - Stratégie de traitement ?
+
+    [ERROR] INTERDIT : Mentionner valeurs manquantes sans les analyser
+    [OK] OBLIGATOIRE : Section complète si valeurs manquantes > 0%
+
+
+    ╔══════════════════════════════════════════════════════════════════════════════╗
+    ║ SECTION 4 : TEMPLATES CODE PRÊTS À L'EMPLOI                                 ║
+    ╚══════════════════════════════════════════════════════════════════════════════╝
+
+    Copiez-collez ces templates selon vos besoins.
+
+    ┌──────────────────────────────────────────────────────────────────────────────┐
+    │ 📝 TEMPLATE 1 : Distribution avec fallback                                  │
+    └──────────────────────────────────────────────────────────────────────────────┘
+
+    ```python
+    try:
+        # Graphique
+        fig, ax = plt.subplots(figsize=(10, 6))
+        df['variable'].value_counts().plot(kind='bar', ax=ax)
+        ax.set_title("Distribution")
+        ax.tick_params(axis='x', labelrotation=45)
+        for label in ax.get_xticklabels():
+            label.set_ha('right')
+        plt.tight_layout()
+        plt.show()
+        
+        print(f"**Graphique {{chapitre}}.{{figure_counter}} : Distribution**")
+        figure_counter += 1
+
+    except:
+        # Tableau fallback
+        counts = df['variable'].value_counts()
+        print(f"**Tableau {{chapitre}}.{{tableau_counter}} : Distribution**")
+        print()
+        print("| Catégorie | Effectif | % |")
+        print("|-----------|----------|---|")
+        for cat, count in counts.items():
+            pct = count / len(df) * 100
+            print(f"| {{cat}} | {{count}} | {{pct:.1f}}% |")
+        tableau_counter += 1
+    ```
+
+    ┌──────────────────────────────────────────────────────────────────────────────┐
+    │ 📝 TEMPLATE 2 : Corrélations (heatmap)                                      │
+    └──────────────────────────────────────────────────────────────────────────────┘
+
+    ```python
+    try:
+        fig, ax = plt.subplots(figsize=(12, 10))
+        sns.heatmap(df.corr(), annot=True, fmt='.2f', cmap='coolwarm', ax=ax)
+        plt.title("Corrélations")
+        plt.tight_layout()
+        plt.show()
+        
+        print(f"**Graphique {{chapitre}}.{{figure_counter}} : Corrélations**")
+        figure_counter += 1
+
+    except:
+        print(f"**Tableau {{chapitre}}.{{tableau_counter}} : Corrélations**")
+        # ... tableau corrélations ...
+        tableau_counter += 1
+    ```
+
+    ┌──────────────────────────────────────────────────────────────────────────────┐
+    │ 📝 TEMPLATE 3 : Variable encodée                                            │
+    └──────────────────────────────────────────────────────────────────────────────┘
+
+    ```python
+    col = 'Age du promoteur'
+
+    if df[col].nunique() < 10:
+        # Encodée
+        print(f"**Distribution de {{col}} :**")
+        print()
+        print("| Catégorie | Effectif | % |")
+        print("|-----------|----------|---|")
+        freq = df[col].value_counts().sort_index()
+        for value, count in freq.items():
+            pct = count / len(df) * 100
+            print(f"| Tranche {{int(value)}} | {{count}} | {{pct:.1f}}% |")
+    else:
+        # Continue
+        mean_val = float(df[col].mean())
+        print(f"Moyenne : {{mean_val:.2f}}")
+    ```
+
+    ┌──────────────────────────────────────────────────────────────────────────────┐
+    │ 📝 TEMPLATE 4 : Analyse valeurs manquantes (OBLIGATOIRE si NaN > 0)         │
+    └──────────────────────────────────────────────────────────────────────────────┘
+
+    ```python
+    # Identifier valeurs manquantes
+    Exemple de code à adapter selon le contexte :
+    missing = df.isnull().sum()
+    missing = missing[missing > 0].sort_values(ascending=False)
+
+    if len(missing) > 0:
+        print(f"**Tableau {{chapitre}}.{{tableau_counter}} : Valeurs Manquantes par Variable**")
+        print()
+        print("| Variable | Nombre | % | Impact |")
+        print("|----------|--------|---|--------|")
+        
+        for col, count in missing.items():
+            pct = count / len(df) * 100
+            impact = "Faible" if pct < 1 else "Modéré" if pct < 5 else "Élevé"
+            print(f"| {{col}} | {{count}} | {{pct:.2f}}% | {{impact}} |")
+        
+        print()
+        tableau_counter += 1
+        
+        # INTERPRÉTATION OBLIGATOIRE
+        print(f\"\"\"L'analyse des valeurs manquantes révèle que {{len(missing)}} variables 
+    sont concernées. La variable '{{missing.index[0]}}' présente le taux le plus 
+    élevé avec {{missing.iloc[0] / len(df) * 100:.2f}}% de données manquantes. 
+    Ces valeurs manquantes nécessitent un traitement approprié selon leur nature 
+    et leur proportion avant toute modélisation.\"\"\")
+    ```
+
+
+    ╔══════════════════════════════════════════════════════════════════════════════╗
+    ║ SECTION 5 : CHECKLIST AVANT ENVOI                                           ║
+    ╚══════════════════════════════════════════════════════════════════════════════╝
+
+    Avant de finaliser, VÉRIFIEZ :
+
+    ☐ Initialisation (chapitre, counters) au début de CHAQUE code
+    ☐ Interprétation IMMÉDIATE après CHAQUE tableau/graphique
+    ☐ JAMAIS 2 tableaux ou 2 graphiques consécutifs sans interprétation
+    ☐ Guillemets simples ' dans f-strings (pas ")
+    ☐ Try-except autour de TOUS les graphiques
+    ☐ Variables encodées vérifiées avant moyenne
+    ☐ Numérotation séquentielle tableaux/graphiques
+    ☐ 40% minimum de graphiques
+    ☐ Apostrophes échappées
+    ☐ Conversion float avant formatage
+    ☐ plt.show() AVANT print("**Graphique...**")
+    ☐ Section "Valeurs Manquantes" si des NaN existent
+    ☐ Pas de duplication de code ou de tableaux
+    ☐ Chaque analyse est unique et progressive
+    ☐ Si un résultat est déjà montré, passer à l'analyse suivante
+
+
+
+    ╔══════════════════════════════════════════════════════════════════════════════╗
+    ║ 🎯 RÈGLES ADDITIONNELLES IMPORTANTES                                        ║
+    ╚══════════════════════════════════════════════════════════════════════════════╝
+
+    📌 SÉLECTION VARIABLES :
+    - Max 10 pour stats descriptives
+    - Max 5 pour corrélations
+    - Exclure ID, index, Unnamed
+
+    📌 TABLEAUX MARKDOWN :
+    - Chaque ligne DOIT commencer ET finir par |
+    - Format : | Col1 | Col2 |
+
+    📌 LABELS VARIABLES ENCODÉES :
+    - Pas "Tranche 1, Tranche 2"
+    - Utiliser labels contextuels (ex: "< 25 ans", "25-35 ans")
+
+    📌 INTERDICTIONS ABSOLUES :
+    - [ERROR] print(df.info())
+    - [ERROR] df.to_markdown() ou .to_markdown() (utiliser .to_string() à la place)
+    - [ERROR] pd.read_csv() ou pd.read_excel() (df déjà chargé automatiquement)
+    - [ERROR] import os; os.environ[...] (configuration système interdite)
+    - [ERROR] Statsmodels (utiliser scipy.stats)
+    - [ERROR] Créer des variables intermédiaires (df_kpi, df_temp, etc.) utilisées dans un autre bloc
+    - [ERROR] Blocs try: vides (toujours mettre au moins 'pass' dans le try)
+    - [ERROR] Paramètres matplotlib abrégés (ha=, va=) - utiliser noms complets
+    - [ERROR] Plusieurs éléments visuels sans interprétation
+    - [ERROR] Tableaux consécutifs sans interprétation entre eux
+    - [ERROR] Mentionner valeurs manquantes sans les analyser
+    - [ERROR] Écrire "Voici le code..." ou expliquer le code avant de l'écrire
+    - [ERROR] Dire "Le code suivant..." ou "Nous allons exécuter..."
+    📌 COMMENT ÉCRIRE :
+    [ERROR] MAUVAIS :
+
+    ```
+    Voici le code Python pour analyser les données :
+
+    ```python
+    import pandas as pd
+    ...
+    ```
+
+    Les résultats montrent...
+    ```
+
+    [OK] CORRECT :
+    ```
+    Analysons la distribution des entreprises par région.
+
+    ```python
+    # Pour afficher un tableau Markdown
+    print(f"**Tableau {{chapitre}}.{{tableau_counter}} : Distribution par région**")
+    print()
+    print("| Région | Nombre | % |")
+    print("|--------|--------|---|")
+    for region, count in df['Region'].value_counts().items():
+        pct = count / len(df) * 100
+        print(f"| {{region}} | {{count}} | {{pct:.1f}}% |")
+    tableau_counter += 1
+    ```
+
+    L'analyse révèle une forte concentration dans la région OUEST...
+    ```
+
+    [ERROR] NE PAS UTILISER :
+    ```python
+    # INTERDIT - tabulate non disponible
+    print(df.to_markdown())
+    ```
+
+    [OK] UTILISER À LA PLACE :
+    ```python
+    # Méthode 1: Tableaux manuels (recommandé pour contrôle)
+    print("| Col1 | Col2 |")
+    print("|------|------|")
+    print(f"| {{val1}} | {{val2}} |")
+    
+    # Méthode 2: to_string() pour tableaux simples
+    print(df.head().to_string())
+    ```
+
+    → Le code sera EXÉCUTÉ et SUPPRIMÉ, seuls les résultats restent !
+
+    [WARNING] RÈGLE CRITIQUE : INDÉPENDANCE DES BLOCS DE CODE
+    
+    Chaque bloc ```python...``` est exécuté INDÉPENDAMMENT.
+    Les variables créées dans un bloc N'EXISTENT PAS dans le bloc suivant !
+    
+    [ERROR] INTERDIT (ne fonctionnera PAS) :
+    ```python
+    # Bloc 1
+    df_kpi = df.copy()
+    df_kpi['CA_per_emp'] = df_kpi['CA'] / df_kpi['Effectifs']
+    ```
+    
+    Plus tard dans une autre section...
+    
+    ```python
+    # Bloc 2 - [ERROR] ERREUR: df_kpi n'existe plus !
+    result = df_kpi.groupby('Region').mean()
+    ```
+    
+    [OK] CORRECT (tout dans UN SEUL bloc) :
+    ```python
+    # Créer, calculer ET utiliser dans le MÊME bloc
+    ca_per_emp = df['CA'] / df['Effectifs'].replace(0, 1)  # Éviter division par 0
+    result = ca_per_emp.groupby(df['Region']).mean()
+    
+    print("**Tableau X : CA par employé par région**")
+    for region, value in result.items():
+        print(f"| {{region}} | {{value:.0f}} |")
+    ```
+    
+    💡 RÈGLE D'OR : 
+    - Utilisez TOUJOURS 'df' directement
+    - NE créez PAS df_kpi, df_temp, df_filtered, etc.
+    - Faites tous les calculs dans UN SEUL bloc de code
+
+    [DATA] RÈGLES MATPLOTLIB :
+    
+    [ERROR] INTERDIT (paramètres abrégés) :
+    ```python
+    plt.xticks(rotation=45, ha='center')  # [ERROR] 'ha' non reconnu
+    plt.yticks(va='top')                   # [ERROR] 'va' non reconnu
+    ```
+    
+    [OK] CORRECT (noms complets) :
+    ```python
+    plt.xticks(rotation=45, ha='center')  # [OK]
+    plt.yticks(verticalalignment='top')                    # [OK]
+    ```
+    
+    
+    
+    📊 RÈGLES TABLEAU vs GRAPHIQUE (éviter redondance) :
+    
+    ⚠️ PRINCIPE : Ne PAS créer tableau ET graphique pour la MÊME information simple
+    
+    ✅ GRAPHIQUE SEUL (pas de tableau) si :
+    ```python
+    # Variable catégorielle simple (< 10 modalités)
+    # Exemple : Sexe (2), Region (10), Situation matrimoniale (5)
+    plt.bar(categories, values)
+    # → Graphique SUFFIT, PAS de tableau markdown
+    ```
+    
+    ✅ TABLEAU SEUL (pas de graphique) si :
+    ```python
+    # Trop de modalités (> 15) OU chiffres précis essentiels
+    # Exemple : 50 secteurs d'activité, montants financiers exacts
+    # → Créer uniquement tableau markdown, PAS de plt
+    ```
+    
+    ✅ TABLEAU + GRAPHIQUE ensemble si :
+    ```python
+    # Évolution temporelle OU comparaison multi-dimensionnelle
+    # Exemple : CA par région sur 5 ans, performance multi-critères
+    # → Graphique (tendance) + Tableau (valeurs précises)
+    ```
+    
+    ❌ ERREUR FRÉQUENTE :
+    ```python
+    # Distribution simple Sexe (2 modalités)
+    # Créer tableau : | Homme | 70% | Femme | 30% |
+    # Créer graphique : barre chart
+    # → REDONDANT ! Garder seulement le graphique
+    ```
+    
+    🎯 DÉCISION RAPIDE :
+    - Modalités < 10 + distribution simple ? → GRAPHIQUE seul
+    - Modalités > 15 + précision importante ? → TABLEAU seul
+    - Évolution temporelle ou complexe ? → GRAPHIQUE + TABLEAU
+    
+    🔧 BLOCS TRY/EXCEPT :
+    
+    [ERROR] INTERDIT (try vide) :
+    ```python
+    try:
+    except Exception:
+        pass
+    ```
+    
+    [OK] CORRECT :
+    ```python
+    try:
+        # Code ici
+        plt.savefig('graph.png')
+    except Exception as e:
+        print(f"Erreur: {{e}}")
+    ```
+
+    📌 OBLIGATIONS :
+    - Interprétation APRÈS CHAQUE tableau/graphique
+    - Section "Valeurs Manquantes" si NaN > 0%
+    - Minimum 2 phrases par interprétation
+    - Références correctes (tableau vs graphique)
+
+    Autres promptes a prendre en compte
+
+    [OK] EXEMPLE  : Graphiques avec détection automatique
+
+    ```python
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+
+    # Détecter automatiquement les colonnes numériques
+    numeric_cols = df.select_dtypes(include=['number']).columns.tolist()
+    exclude_keywords = ['id', 'index', 'unnamed', 'key', 'code', 'numero']
+    numeric_cols = [col for col in numeric_cols 
+                    if not any(kw in col.lower() for kw in exclude_keywords)]
+
+    # Créer un histogramme avec la première colonne numérique (non encodée)
+    if numeric_cols:
+        # Trouver première colonne avec > 10 valeurs uniques
+        for col in numeric_cols:
+            if df[col].nunique() > 10:
+                plt.figure(figsize=(10, 6))
+                sns.histplot(df[col], bins=20, kde=True)
+                plt.title(f'Distribution de {{col}}')
+                plt.xlabel(col)
+                plt.ylabel('Fréquence')
+                plt.show()
+                break
+    ```
+
+    ═══════════════════════════════════════════════════════════════════════════════
+    6. ORGANISATION NARRATIVE (RAPPORT PROFESSIONNEL)
+    ═══════════════════════════════════════════════════════════════════════════════
+
+    Structure requise pour CHAQUE analyse :
+
+    1️⃣ Introduction contextuelle (1-2 phrases)
+    2️⃣ [Code Python → Élément visuel (tableau OU graphique)]
+    3️⃣ Interprétation immédiate en prose (2-4 phrases, SANS marqueur)
+    4️⃣ Implications/discussion (1-2 phrases)
+    5️⃣ Transition vers l'analyse suivante (1 phrase)
+    6️⃣ [Répéter pour chaque élément visuel]
+
+    🔴 CARACTÉRISTIQUES D'UN RAPPORT PROFESSIONNEL :
+
+    [OK] CE QU'ON VEUT :
+    - Prose fluide et naturelle
+    - Transitions entre les parties
+    - Interprétation intégrée au texte
+    - Ton analytique mais accessible
+    - Style de publication scientifique
+    - JAMAIS 2+ tableaux/graphiques sans interprétation entre eux
+
+    [ERROR] CE QU'ON NE VEUT PAS :
+    - **Interprétation :** ...
+    - **Analyse :** ...
+    - **Discussion :** ...
+    - Bullet points pour les interprétations
+    - Style "devoir scolaire"
+    - Plusieurs éléments visuels consécutifs sans texte
+
+    ═══════════════════════════════════════════════════════════════════════════════
+    7. RÈGLES DE CONCISION
+    ═══════════════════════════════════════════════════════════════════════════════
+
+    [WARNING] ÉVITER LA VERBOSITÉ EXCESSIVE :
+
+    [ERROR] TROP LONG :
+    "L'analyse approfondie des données collectées révèle de manière significative et 
+    notable que la distribution observée des valeurs au sein de l'échantillon étudié 
+    présente une configuration particulière qui mérite une attention toute particulière..."
+
+    [OK] CONCIS ET PRÉCIS :
+    "L'analyse révèle une distribution asymétrique, avec 75% des valeurs concentrées 
+    entre 20 et 40 ans. Cette concentration suggère une population jeune, cohérente 
+    avec le contexte urbain."
+
+    RÈGLES :
+    - Phrases de 15-25 mots maximum
+    - Éviter les répétitions ("significatif", "notable", "important")
+    - Aller droit au fait
+    - Chiffres précis plutôt que qualificatifs vagues
+
+    ═══════════════════════════════════════════════════════════════════════════════
+    8. ANALYSES STATISTIQUES
+    ═══════════════════════════════════════════════════════════════════════════════
+
+    - Variables disponibles : {{self._get_available_variables()}}
+    - Utiliser pandas pour les calculs
+    - Interpréter les résultats statistiques
+    - TOUJOURS expliquer ce que signifient les chiffres
+    - Vérifier si variables encodées avant calculs de moyennes/écarts-types
+
+    ═══════════════════════════════════════════════════════════════════════════════
+    9. À ÉVITER ABSOLUMENT
+    ═══════════════════════════════════════════════════════════════════════════════
+
+    [ERROR] Répéter les analyses des chapitres précédents
+    [ERROR] Utiliser les mêmes graphiques qu'avant
+    [ERROR] Être trop technique sans vulgariser
+    [ERROR] Enchaîner 2+ tableaux/graphiques sans interprétation entre eux
+    [ERROR] Dire "graphique ci-dessus" quand c'est un tableau
+    [ERROR] Dire "tableau ci-dessus" quand c'est un graphique
+    [ERROR] Utiliser des marqueurs scolaires (**Interprétation:**, **Analyse:**)
+    [ERROR] Calculer des moyennes sur des variables encodées
+
+    ═══════════════════════════════════════════════════════════════════════════════
+
+    DONNÉES :
+    Le fichier de données est disponible à : {{self.csv_path}}
+
+    Génère maintenant le Chapitre {chapter.number} en Markdown complet en respectant 
+    SCRUPULEUSEMENT toutes ces règles, en particulier :
+    1. Interprétation IMMÉDIATE après CHAQUE tableau/graphique
+    2. Vérification des variables encodées
+    3. Références correctes (tableau vs graphique)
+    4. Gestion robuste des erreurs (KeyError, TypeError)
+    5. Conversion float() avant formatage
+    ══════════════════════════════════════════════════════════════
+    🔴 Rappel:RÈGLE D’ORDRE ABSOLUE DES GRAPHIQUES (NON NÉGOCIABLE)
+    ══════════════════════════════════════════════════════════════
+
+    POUR CHAQUE GRAPHIQUE, L’ORDRE DE SORTIE DOIT ÊTRE STRICTEMENT :
+
+    1️⃣ CODE PYTHON AVEC plt.show()  
+    2️⃣ LIGNE DE TITRE DU GRAPHIQUE (Graphique X.Y : …)  
+    3️⃣ PARAGRAPHE D’INTERPRÉTATION IMMÉDIAT (2–4 phrases)
+
+    [WARNING] INTERDICTIONS FORMELLES :
+    [ERROR] Ne JAMAIS écrire le titre du graphique AVANT le code
+    [ERROR] Ne JAMAIS écrire l’interprétation AVANT plt.show()
+    [ERROR] Ne JAMAIS écrire “Le graphique ci-dessus…” AVANT que le graphique soit affiché
+
+    [OK] Le titre du graphique DOIT être imprimé JUSTE APRÈS plt.show() via print().
+
+    ```markdown
+    🔴 RÈGLE LEXICALE STRICTE :
+
+    L’expression “Le graphique ci-dessus” est AUTORISÉE UNIQUEMENT :
+    [OK] après que le graphique a été affiché (plt.show())
+    [OK] après que la ligne “Graphique X.Y : …” a été imprimée
+
+    [ERROR] INTERDIT d’utiliser cette expression avant le code ou avant le titre.```
+
+    ╔══════════════════════════════════════════════════════════════════════════════╗
+    ║ 🚀 GÉNÉREZ MAINTENANT LE CHAPITRE !                                         ║
+    ╚══════════════════════════════════════════════════════════════════════════════╝
+
+    Données : {self.csv_path}
+
+    Suivez scrupuleusement les 10 RÈGLES CRITIQUES.
+    En cas de doute, relisez la section correspondante.
+
+    BON TRAVAIL !
+    """
+        
+        # Remplacer variables
+        prompt = prompt.replace("{chapter.number}", str(chapter.number))
+        prompt = prompt.replace("{chapter.title}", chapter.title)
+        
+        return prompt
+    
+    def _get_available_variables(self) -> str:
+        """Retourne les variables disponibles dans le fichier"""
+        try:
+            import pandas as pd
+            import os
+            
+            file_extension = os.path.splitext(self.csv_path)[1].lower()
+            
+            if file_extension in ['.xlsx', '.xls']:
+                df_temp = pd.read_excel(self.csv_path)
+            else:
+                df_temp = pd.read_csv(self.csv_path)
+            
+            return ", ".join(df_temp.columns.tolist()[:10]) + ("..." if len(df_temp.columns) > 10 else "")
+        except:
+            return "(colonnes non listées)"
+    
+    def _generate_with_ai(self, prompt: str, task_type: str = "default") -> str:
+        """
+        Génère le contenu avec l'IA (Gemini ou Claude en backup)
+        
+        Args:
+            prompt: Le prompt
+            task_type: Type de tâche pour sélectionner le meilleur modèle
+        
+        NOUVEAUTÉ: Support multi-modèles + fallback automatique + spécialisation
+        """
+        import os
+        
+        # Vérifier si on force l'utilisation de Claude
+        use_claude = os.getenv("USE_CLAUDE", "false").lower() == "true"
+        
+        if use_claude:
+            logger.info("Using Claude API (forced via USE_CLAUDE)")
+            return self._generate_with_claude(prompt)
+        
+        # Essayer Gemini d'abord avec le modèle spécialisé
+        try:
+            return self._generate_with_gemini(prompt, task_type=task_type)
+        
+        except Exception as e:
+            error_msg = str(e)
+            
+            # Si quota dépassé, essayer Claude en backup
+            if "429" in error_msg or "quota" in error_msg.lower():
+                logger.warning(f"Gemini quota exceeded, falling back to Claude: {error_msg}")
+                
+                try:
+                    return self._generate_with_claude(prompt)
+                except Exception as claude_error:
+                    logger.error(f"Claude also failed: {claude_error}")
+                    raise Exception(f"Both Gemini and Claude failed. Gemini: {error_msg}, Claude: {claude_error}")
+            
+            # Autre erreur, relancer
+            raise
+    
+    def _generate_with_gemini(self, prompt: str, task_type: str = "default") -> str:
+        """
+        Génère avec Gemini en utilisant un modèle spécialisé selon la tâche
+        
+        Args:
+            prompt: Le prompt à envoyer
+            task_type: Type de tâche ("code", "writing", "analysis", "plan", "default")
+        """
+        import google.generativeai as genai
+        import os
+        
+        genai.configure(api_key=os.getenv("GMINI_API_KEY"))
+        
+        # Sélection du modèle selon le type de tâche
+        model_map = {
+            "code": os.getenv("GEMINI_MODEL_CODE", "gemini-2.5-flash"),
+            "writing": os.getenv("GEMINI_MODEL_WRITING", "gemini-2.5-pro"),
+            "analysis": os.getenv("GEMINI_MODEL_ANALYSIS", "gemini-2.5-pro"),
+            "plan": os.getenv("GEMINI_MODEL_PLAN", "gemini-2.5-flash"),
+            "default": os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
+        }
+        
+        model_name = model_map.get(task_type, model_map["default"])
+        
+        logger.info(f"Using Gemini model: {model_name} for task: {task_type}")
+        
+        model = genai.GenerativeModel(model_name)
+        
+        response = model.generate_content(prompt)
+        
+        return response.text
+    
+    def _generate_with_claude(self, prompt: str) -> str:
+        """Génère avec Claude (backup si Gemini quota dépassé)"""
+        import os
+        
+        try:
+            from anthropic import Anthropic
+        except ImportError:
+            raise ImportError("Package 'anthropic' requis. Installez avec: pip install anthropic")
+        
+        client = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+        
+        logger.info("Using Claude API (claude-3-5-sonnet)")
+        
+        response = client.messages.create(
+            model="claude-3-5-sonnet-20241022",
+            max_tokens=4000,
+            messages=[
+                {"role": "user", "content": prompt}
+            ]
+        )
+        
+        return response.content[0].text
+    def _execute_code_blocks(self, content: str) -> str:
+            """
+            Exécute les blocs de code Python. 
+            Version stabilisée : respecte l'indentation interne des blocs try/if.
+            """
+            import re
+            import os
+            import base64
+            from e2b_session_manager import execute_python_code
+
+            pattern = r'[ \t]*```python\n([\s\S]*?)\n[ \t]*```'
+            matches = list(re.finditer(pattern, content))
+            if not matches: return content
+
+            modified_content = content
+            # Préparation du chargement des données
+            file_extension = os.path.splitext(self.csv_path)[1].lower()
+            try:
+                if file_extension in ['.xlsx', '.xls']:
+                    with open(self.csv_path, 'rb') as f:
+                        file_base64 = base64.b64encode(f.read()).decode('utf-8')
+                    data_loading_code = f"import pandas as pd\nimport io, base64\ndf = pd.read_excel(io.BytesIO(base64.b64decode('{file_base64}')))"
+                else:
+                    with open(self.csv_path, 'r', encoding='utf-8', errors='replace') as f:
+                        csv_text = f.read().replace("'''", '"""')
+                    data_loading_code = f"import pandas as pd\nimport io\ndf = pd.read_csv(io.StringIO('''{csv_text}'''))"
+            except Exception as e:
+                data_loading_code = f"# Erreur : {str(e)}"
+
+            for match in reversed(matches):
+                start, end = match.span()
+                raw_code = match.group(1)
+                
+                # --- NETTOYAGE INTELLIGENT DE L'INDENTATION ---
+                lines = raw_code.split('\n')
+                # On retire uniquement l'indentation commune la plus petite (marge Markdown)
+                # sans toucher à l'indentation relative des blocs internes (try/except/if)
+                non_empty_lines = [l for l in lines if l.strip()]
+                if non_empty_lines:
+                    margin = min(len(l) - len(l.lstrip()) for l in non_empty_lines)
+                    cleaned_lines = [l[margin:] if len(l) >= margin else l.lstrip() for l in lines]
+                else:
+                    cleaned_lines = lines
+
+                # Filtrage des lignes toxiques (pd.read_ et config E2B)
+                final_code_lines = []
+                for l in cleaned_lines:
+                    if any(x in l for x in ['pd.read_', 'E2B_EVENTS_ADDRESS', 'os.environ']): continue
+                    
+                    # Remplacer .to_markdown() par .to_string() (tabulate non disponible dans E2B)
+                    if '.to_markdown(' in l:
+                        l = l.replace('.to_markdown(', '.to_string(')
+                        logger.warning(f"Replaced .to_markdown() with .to_string() in line")
+                    if 'to_markdown()' in l:
+                        l = l.replace('to_markdown()', 'to_string()')
+                        logger.warning(f"Replaced to_markdown() with to_string() in line")
+                    
+                    final_code_lines.append(l)
+                
+                final_code = "\n".join(final_code_lines)
+                
+                # ═══════════════════════════════════════════════════════════
+                # NOUVELLES CORRECTIONS (Patch #3)
+                # ═══════════════════════════════════════════════════════════
+                
+                # Correction 1: Compléter les blocs try vides
+                lines = final_code.split('\n')
+                fixed_lines = []
+                for i, line in enumerate(lines):
+                    fixed_lines.append(line)
+                    if line.strip().endswith('try:') and i+1 < len(lines):
+                        next_line = lines[i+1].strip()
+                        if next_line.startswith('except'):
+                            indent = len(line) - len(line.lstrip()) + 4
+                            fixed_lines.append(' ' * indent + 'pass')
+                            logger.warning("Added 'pass' in empty try block")
+                
+                final_code = '\n'.join(fixed_lines)
+                
+                # Correction 2: Remplacer variables non définies par 'df'
+                undefined_vars = ['df_kpi', 'df_clean_n_annee', 'df_filtered', 'df_temp', 'df_analysis', 'df_copy']
+                for var in undefined_vars:
+                    if var in final_code and f"{var} =" not in final_code and f"{var}=" not in final_code:
+                        logger.warning(f"Variable '{var}' used but not defined - replacing with 'df'")
+                        final_code = final_code.replace(var, 'df')
+                
+                # Correction 3: Remplacer paramètres matplotlib abrégés
+                #if 'ha=' in final_code:
+                    #final_code = final_code.replace('ha=', 'horizontalalignment=')
+                    #logger.warning("Replaced 'ha=' with 'horizontalalignment='")
+               # if 'va=' in final_code:
+                   # final_code = final_code.replace('va=', 'verticalalignment=')
+                   # logger.warning("Replaced 'va=' with 'verticalalignment='")
+                
+                full_code = f"""import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+import numpy as np
+import io
+{data_loading_code}
+
+chapitre = {getattr(self.get_current_chapter(), 'number', 1)}
+tableau_counter = 1
+figure_counter = 1
+plt.style.use('seaborn-v0_8-darkgrid')
+
+{final_code}
+
+if plt.get_fignums():
+    plt.show()
+"""
+                result = execute_python_code(self.user_id, full_code)
+                
+                result_section = ""
+                if result['success']:
+                    if result.get('output'):
+                        # Ajout de sauts de ligne pour forcer le rendu Markdown des tableaux
+                        result_section += f"\n\n{self._format_output_as_markdown(result['output'])}\n\n"
+                    if result.get('charts'):
+                        for chart_b64 in result['charts']:
+                            result_section += f"\n![Graphique](data:image/png;base64,{chart_b64})\n"
+                else:
+                    result_section = f"\n> [WARNING] **Erreur d'analyse :** {result.get('error')}\n"
+
+                modified_content = modified_content[:start] + result_section + modified_content[end:]
+                
+            return modified_content
+        
+    def _format_output_as_markdown(self, text: str) -> str:
+        """Convertit les sorties texte en Markdown formaté avec tableaux professionnels"""
+        if not text or not text.strip():
+            return ""
+        
+        # Si c'est un tableau de statistiques, le formater avec TableFormatter
+        if 'count' in text and 'mean' in text:
+            return self._convert_stats_to_markdown_table(text)
+        
+        # Sinon retourner le texte tel quel
+        return text
+    
+    def _convert_stats_to_markdown_table(self, stats_text: str) -> str:
+        """Convertit df.describe() en tableau Markdown professionnel avec TableFormatter"""
+        try:
+            import pandas as pd
+            import io
+            
+            lines = [line.strip() for line in stats_text.strip().split('\n') if line.strip()]
+            
+            if len(lines) < 2:
+                return stats_text
+            
+            # Créer un DataFrame à partir du texte
+            try:
+                df_stats = pd.read_csv(io.StringIO(stats_text), sep=r'\s+')
+                
+                # Transposer pour avoir les statistiques en colonnes
+                df_stats = df_stats.T
+                
+                # Utiliser TableFormatter
+                formatter = TableFormatter(style='professional')
+                
+                return formatter.dataframe_to_markdown(
+                    df_stats,
+                    precision=2,
+                    include_index=True
+                )
+            except Exception as parse_error:
+                # Si le parsing échoue, formater manuellement
+                result = "\n**Statistiques descriptives :**\n\n"
+                result += "| Statistique | Valeur |\n"
+                result += "|-------------|--------|\n"
+                
+                for line in lines[1:]:  # Skip header
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        stat_name = parts[0]
+                        stat_value = parts[1]
+                        result += f"| {stat_name} | {stat_value} |\n"
+                
+                return result
+        except Exception as e:
+            logger.warning(f"Failed to format stats table: {e}")
+            return stats_text
+    
+    def validate_chapter(self, chapter_number: str) -> bool:
+        """
+        Valide un chapitre
+        
+        Returns:
+            True si chapitre trouvé et validé
+        """
+        chapter = self._find_chapter(chapter_number)
+        
+        if not chapter:
+            return False
+        
+        if chapter.status != ChapterStatus.GENERATED:
+            logger.warning(f"Cannot validate chapter {chapter_number}: status is {chapter.status}")
+            return False
+        
+        chapter.status = ChapterStatus.VALIDATED
+        chapter.validated_at = datetime.now()
+        
+        # Ajouter à la mémoire contextuelle
+        add_chapter_to_memory(
+            self.user_id,
+            chapter.number,
+            chapter.title,
+            chapter.content,
+            metadata={'csv_path': self.csv_path}
+        )
+        
+        # Passer au chapitre suivant
+        self.current_chapter_index += 1
+        
+        logger.info(f"Chapter {chapter_number} validated")
+        
+        return True
+    
+    def reject_chapter(self, chapter_number: str, reason: str = None) -> bool:
+        """
+        Rejette un chapitre (à regénérer)
+        
+        Returns:
+            True si chapitre trouvé et rejeté
+        """
+        chapter = self._find_chapter(chapter_number)
+        
+        if not chapter:
+            return False
+        
+        chapter.status = ChapterStatus.REJECTED
+        chapter.error_message = reason
+        
+        logger.info(f"Chapter {chapter_number} rejected: {reason}")
+        
+        return True
+    
+    def _find_chapter(self, chapter_number: str) -> Optional[Chapter]:
+        """Trouve un chapitre par son numéro"""
+        for chapter in self.chapters:
+            if chapter.number == chapter_number:
+                return chapter
+        return None
+    
+    def is_complete(self) -> bool:
+        """Vérifie si tous les chapitres sont validés"""
+        return all(
+            chapter.status == ChapterStatus.VALIDATED
+            for chapter in self.chapters
+        )
+    
+    def get_progress(self) -> Dict:
+        """Retourne la progression"""
+        total = len(self.chapters)
+        validated = sum(1 for c in self.chapters if c.status == ChapterStatus.VALIDATED)
+        
+        return {
+            'total_chapters': total,
+            'validated_chapters': validated,
+            'current_chapter': self.current_chapter_index + 1,
+            'progress_percent': (validated / total * 100) if total > 0 else 0,
+            'is_complete': self.is_complete()
+        }
+    
+    def auto_review_final_report(self, report_markdown: str = None, save_to_file: bool = True) -> dict:
+        """
+        Auto-review du rapport complet.
+        
+        Args:
+            report_markdown: Contenu Markdown (si None, compile automatiquement)
+            save_to_file: Sauvegarde rapport d'amélioration
+        """
+        logger.info("=" * 70)
+        logger.info("AUTO-REVIEW DU RAPPORT")
+        logger.info("=" * 70)
+        
+        try:
+            if report_markdown is None:
+                report_markdown = self.compile_report()
+            
+            review_result = auto_review_report(report_markdown)
+            
+            if not review_result.get('success'):
+                logger.error(f"Auto-review failed: {review_result.get('error')}")
+                return review_result
+            
+            logger.info("[OK] Auto-review completed")
+            
+            if save_to_file:
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                filename = f"rapport_review_{timestamp}.md"
+                
+                with open(filename, 'w', encoding='utf-8') as f:
+                    f.write(f"# Auto-Review\\n\\n{review_result.get('full_review', '')}")
+                
+                logger.info(f"📄 Review saved: {filename}")
+                review_result['saved_to'] = filename
+            
+            return review_result
+            
+        except Exception as e:
+            logger.error(f"Auto-review error: {e}", exc_info=True)
+            return {'success': False, 'error': str(e)}
+    
+    def compile_report(self) -> str:
+        """
+        Compile tous les chapitres validés en un rapport final
+        
+        Returns:
+            Rapport complet en Markdown
+        """
+        if not self.is_complete():
+            logger.warning("Attempting to compile incomplete report")
+        
+        report = f"""# {self.plan.get('titre', 'Rapport Statistique')}
+
+**Date:** {self.plan.get('date', datetime.now().strftime('%Y-%m-%d'))}  
+**Auteur:** {self.plan.get('auteur', 'AI Statistical Reporter')}
+
+---
+
+## Table des matières
+
+"""
+        
+        # Table des matières
+        for chapter in self.chapters:
+            report += f"{chapter.number}. [{chapter.title}](#{chapter.number.replace('.', '')})\n"
+        
+        report += "\n---\n\n"
+        
+        # Contenu des chapitres
+        for chapter in self.chapters:
+            if chapter.status == ChapterStatus.VALIDATED and chapter.content:
+                report += chapter.content + "\n\n---\n\n"
+        
+        logger.info(f"Report compiled: {len(report)} characters")
+        
+        return report
+
+
+# ============================================
+# FONCTIONS POUR STREAMLIT
+# ============================================
+
+def initialize_workflow(user_id: str, plan: Dict, csv_path: str, cost_controller=None, study_context=None) -> ReportGenerationWorkflow:
+    """
+    Initialise un workflow de génération
+    
+    Args:
+        user_id: ID de l'utilisateur
+        plan: Plan du rapport
+        csv_path: Chemin vers le fichier CSV/Excel
+        cost_controller: (Optionnel) Contrôleur de coûts
+        study_context: (Optionnel) Contexte de l'étude
+    
+    Usage dans Streamlit:
+        if 'workflow' not in st.session_state:
+            st.session_state.workflow = initialize_workflow(
+                st.session_state.user_id,
+                st.session_state.plan,
+                st.session_state.csv_path,
+                cost_controller=st.session_state.cost_controller,
+                study_context=st.session_state.study_context
+            )
+    """
+    return ReportGenerationWorkflow(user_id, plan, csv_path, cost_controller, study_context)
+
+
+def display_workflow_progress(workflow: ReportGenerationWorkflow):
+    """
+    Affiche la progression du workflow dans Streamlit
+    
+    Usage:
+        display_workflow_progress(st.session_state.workflow)
+    """
+    import streamlit as st
+    
+    progress = workflow.get_progress()
+    
+    st.progress(
+        progress['progress_percent'] / 100,
+        text=f"Progression : {progress['validated_chapters']}/{progress['total_chapters']} chapitres validés"
+    )
+    
+    # Liste des chapitres avec statuts
+    for i, chapter in enumerate(workflow.chapters, 1):
+        status_emoji = {
+            ChapterStatus.PENDING: "⏳",
+            ChapterStatus.GENERATING: "▶️",
+            ChapterStatus.GENERATED: "👁️",
+            ChapterStatus.VALIDATED: "[OK]",
+            ChapterStatus.REJECTED: "[ERROR]",
+            ChapterStatus.ERROR: "[WARNING]"
+        }
+        
+        emoji = status_emoji.get(chapter.status, "•")
+        
+        st.markdown(f"{emoji} **{chapter.number}. {chapter.title}** - {chapter.status.value}")
+
+
+# ============================================
+# TESTS
+# ============================================
+
+if __name__ == "__main__":
+    """Tests du workflow"""
+    
+    print("="*60)
+    print("TEST REPORT GENERATION WORKFLOW - VERSION CORRIGÉE")
+    print("="*60)
+    
+    # Plan exemple
+    plan = {
+        'titre': 'Test Report',
+        'date': '2025-12-27',
+        'auteur': 'Test',
+        'chapitres': [
+            {
+                'numero': '1',
+                'titre': 'Introduction',
+                'sections': [
+                    {
+                        'titre': 'Contexte',
+                        'analyses': ['Présentation données', 'Objectifs']
+                    }
+                ]
+            },
+            {
+                'numero': '2',
+                'titre': 'Analyse',
+                'sections': [
+                    {
+                        'titre': 'Statistiques',
+                        'analyses': ['Moyennes', 'Écarts-types']
+                    }
+                ]
+            }
+        ]
+    }
+    
+    print("\n1. Initialisation workflow...")
+    workflow = ReportGenerationWorkflow('test_user', plan, 'test.csv')
+    print(f"[OK] {len(workflow.chapters)} chapitres initialisés")
+    
+    print("\n2. Progression initiale...")
+    progress = workflow.get_progress()
+    print(f"[OK] Progression: {progress}")
+    
+    print("\n3. Chapitre en cours...")
+    current = workflow.get_current_chapter()
+    print(f"[OK] Chapitre courant: {current.number}. {current.title}")
+    
+    print("\n[OK] Tests terminés (génération complète nécessite E2B + Gemini)")
+    print("\n🎯 AMÉLIORATIONS PRINCIPALES :")
+    print("   [OK] Gestion robuste des erreurs (KeyError, TypeError)")
+    print("   [OK] Décodage des variables encodées")
+    print("   [OK] Interprétations obligatoires après chaque élément visuel")
+    print("   [OK] Références correctes (tableau vs graphique)")
+    print("   [OK] Support Excel + CSV")
+    print("   [OK] Gestion apostrophes dans noms de colonnes")

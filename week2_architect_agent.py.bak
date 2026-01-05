@@ -1,0 +1,878 @@
+"""
+Week 2 - Architect Agent - VERSION RAG COMPLÈTE (CORRIGÉE INS)
+Agent pour analyser les données CSV et générer un plan de rapport
+
+🎯 NOUVEAUTÉS RAG :
+✅ Métadonnées ENRICHIES
+✅ Contraintes STRICTES anti-hallucination
+✅ VALIDATION automatique
+✅ Support profils writing_profiles.py
+✅ E2B corrigé
+⭐ PROFIL INSTITUTIONAL corrigé → Approche INS/Ministères (exploratoire)
+"""
+
+import os
+import json
+from pathlib import Path
+from typing import Dict, Any, Optional, Union
+from datetime import datetime
+
+
+# ═══════════════════════════════════════════════════════════════
+# CONFIGURATION E2B
+# ═══════════════════════════════════════════════════════════════
+
+E2B_CONFIG = {
+    'timeout': 300,
+    'keep_alive': True,
+    'api_key': os.getenv('E2B_API_KEY'),
+    'enabled': os.getenv('USE_E2B', 'false').lower() == 'true'
+}
+
+
+# ═══════════════════════════════════════════════════════════════
+# IMPORT DES PROFILS
+# ═══════════════════════════════════════════════════════════════
+
+try:
+    from study_context import WritingProfile
+    from writing_profiles import get_writing_style_block, get_profile_summary
+    PROFILES_AVAILABLE = True
+except ImportError:
+    PROFILES_AVAILABLE = False
+    class WritingProfile:
+        ACADEMIC = "academic"
+        CONSULTANT = "consultant"
+        INSTITUTIONAL = "institutional"
+
+
+# ═══════════════════════════════════════════════════════════════
+# IMPORT RAG VALIDATOR
+# ═══════════════════════════════════════════════════════════════
+
+try:
+    from rag_validator import validate_plan_against_metadata, print_validation_report
+    RAG_VALIDATOR_AVAILABLE = True
+except ImportError:
+    RAG_VALIDATOR_AVAILABLE = False
+    print("⚠️ rag_validator non disponible - validation désactivée")
+
+
+# ═══════════════════════════════════════════════════════════════
+# ANALYSE CSV ENRICHIE
+# ═══════════════════════════════════════════════════════════════
+
+def analyze_csv(csv_path: str) -> Dict[str, Any]:
+    """Analyse ENRICHIE d'un fichier CSV/Excel avec RAG"""
+    
+    use_e2b = E2B_CONFIG['enabled'] and E2B_CONFIG['api_key']
+    
+    if use_e2b:
+        try:
+            from e2b_code_interpreter import Sandbox
+            print("ℹ️ E2B activé")
+            return _analyze_csv_with_e2b_robust(csv_path)
+        except Exception as e:
+            print(f"⚠️ E2B error, fallback: {e}")
+            return _analyze_csv_locally_enriched(csv_path)
+    else:
+        print("ℹ️ Analyse locale")
+        return _analyze_csv_locally_enriched(csv_path)
+
+
+def _analyze_csv_locally_enriched(csv_path: str) -> Dict[str, Any]:
+    """Version ENRICHIE pour RAG - Analyse détaillée par colonne"""
+    import pandas as pd
+    import numpy as np
+    
+    file_path = Path(csv_path)
+    file_extension = file_path.suffix.lower()
+    
+    # Chargement multi-encodage
+    if file_extension == '.csv':
+        encodings = ['utf-8', 'latin-1', 'iso-8859-1', 'windows-1252', 'cp1252']
+        for encoding in encodings:
+            try:
+                df = pd.read_csv(file_path, encoding=encoding)
+                encoding_used = encoding
+                break
+            except (UnicodeDecodeError, Exception):
+                continue
+        else:
+            raise ValueError("Impossible de détecter l'encodage")
+    
+    elif file_extension in ['.xlsx', '.xls']:
+        df = pd.read_excel(file_path, engine='openpyxl' if file_extension == '.xlsx' else None)
+        encoding_used = 'excel'
+    
+    else:
+        raise ValueError(f"Format non supporté : {file_extension}")
+    
+    # Analyse enrichie colonne par colonne
+    columns_info = []
+    
+    for col in df.columns:
+        col_info = {
+            'name': col,
+            'dtype': str(df[col].dtype),
+            'nunique': int(df[col].nunique()),
+            'missing': int(df[col].isnull().sum()),
+            'missing_pct': float(df[col].isnull().sum() / len(df) * 100) if len(df) > 0 else 0
+        }
+        
+        if pd.api.types.is_numeric_dtype(df[col]):
+            col_info['is_numeric'] = True
+            col_info['is_categorical'] = False
+            
+            col_data = df[col].dropna()
+            if len(col_data) > 0:
+                col_info['min'] = float(col_data.min())
+                col_info['max'] = float(col_data.max())
+                col_info['mean'] = float(col_data.mean())
+                col_info['median'] = float(col_data.median())
+                col_info['std'] = float(col_data.std())
+                col_info['q25'] = float(col_data.quantile(0.25))
+                col_info['q75'] = float(col_data.quantile(0.75))
+                col_info['is_encoded'] = col_info['nunique'] < 10
+                
+                if col_info['is_encoded']:
+                    value_counts = df[col].value_counts().sort_index()
+                    col_info['distribution'] = {str(k): int(v) for k, v in value_counts.items()}
+        else:
+            col_info['is_numeric'] = False
+            col_info['is_categorical'] = True
+            col_info['is_encoded'] = False
+            
+            if col_info['nunique'] < 1000:
+                value_counts = df[col].value_counts().head(10)
+                col_info['top_values'] = {str(k): int(v) for k, v in value_counts.items()}
+                col_info['top_values_pct'] = {
+                    str(k): round(float(v / len(df) * 100), 2)
+                    for k, v in value_counts.items()
+                }
+        
+        columns_info.append(col_info)
+    
+    # Métadonnées complètes
+    metadata = {
+        "file_info": {
+            "filename": file_path.name,
+            "extension": file_extension,
+            "encoding": encoding_used,
+            "size_mb": round(os.path.getsize(csv_path) / (1024 * 1024), 2)
+        },
+        "shape": {
+            "rows": int(len(df)),
+            "columns": int(len(df.columns))
+        },
+        "columns": columns_info,
+        "numeric_columns": [c['name'] for c in columns_info if c.get('is_numeric')],
+        "categorical_columns": [c['name'] for c in columns_info if c.get('is_categorical')],
+        "encoded_columns": [c['name'] for c in columns_info if c.get('is_encoded')],
+        "columns_with_missing": [c['name'] for c in columns_info if c['missing'] > 0],
+        "sample_data": df.head(3).to_dict('records'),
+        "columns_names": list(df.columns),
+        "dtypes": {col: str(dtype) for col, dtype in df.dtypes.items()},
+        "missing_values": {
+            col: {"count": c['missing'], "percentage": c['missing_pct']}
+            for c in columns_info
+        },
+        "basic_stats": {}
+    }
+    
+    for col in metadata["numeric_columns"]:
+        col_data = next(c for c in columns_info if c['name'] == col)
+        if 'mean' in col_data:
+            metadata["basic_stats"][col] = {
+                "count": len(df[col].dropna()),
+                "mean": col_data['mean'],
+                "median": col_data['median'],
+                "std": col_data['std'],
+                "min": col_data['min'],
+                "max": col_data['max'],
+                "q25": col_data['q25'],
+                "q75": col_data['q75']
+            }
+    
+    for col in metadata["categorical_columns"]:
+        col_data = next(c for c in columns_info if c['name'] == col)
+        metadata["basic_stats"][col] = {
+            "unique_count": col_data['nunique'],
+            "most_common": col_data.get('top_values', {})
+        }
+    
+    return metadata
+
+
+def _analyze_csv_with_e2b_robust(csv_path: str) -> Dict[str, Any]:
+    """Version E2B robuste"""
+    from e2b_code_interpreter import Sandbox
+    
+    sandbox = None
+    
+    try:
+        sandbox = Sandbox(
+            api_key=E2B_CONFIG['api_key'],
+            timeout=E2B_CONFIG['timeout'],
+            keep_alive=E2B_CONFIG['keep_alive']
+        )
+        
+        print(f"✅ Sandbox créée : {sandbox.sandbox_id}")
+        result = _analyze_csv_locally_enriched(csv_path)
+        return result
+    
+    except Exception as e:
+        print(f"❌ E2B error : {str(e)[:200]}")
+        raise
+    
+    finally:
+        if sandbox:
+            try:
+                sandbox.close()
+                print(f"✅ Sandbox fermée")
+            except Exception as e:
+                print(f"⚠️ Erreur fermeture : {e}")
+
+
+# ═══════════════════════════════════════════════════════════════
+# GÉNÉRATION DU PLAN AVEC RAG
+# ═══════════════════════════════════════════════════════════════
+
+def generate_report_plan(
+    metadata: Dict[str, Any],
+    study_context: Optional[Any] = None,
+    writing_profile: Optional[Union[str, 'WritingProfile']] = None,
+    max_attempts: int = 3
+) -> Dict[str, Any]:
+    """Génère plan avec VALIDATION RAG automatique"""
+    import google.generativeai as genai
+    
+    api_key = os.getenv("GMINI_API_KEY")
+    if not api_key:
+        raise ValueError("GMINI_API_KEY non trouvée")
+    
+    genai.configure(api_key=api_key)
+    model = genai.GenerativeModel("gemini-2.0-flash-exp")
+    
+    for attempt in range(1, max_attempts + 1):
+        try:
+            print(f"⏳ Génération plan (tentative {attempt}/{max_attempts})...")
+            
+            prompt = _build_dynamic_prompt_with_rag(metadata, study_context, writing_profile)
+            response = model.generate_content(prompt)
+            plan_text = response.text.strip()
+            
+            if "```json" in plan_text:
+                plan_text = plan_text.split("```json")[1].split("```")[0].strip()
+            elif "```" in plan_text:
+                plan_text = plan_text.split("```")[1].split("```")[0].strip()
+            
+            plan = json.loads(plan_text)
+            
+            # Validation RAG
+            if RAG_VALIDATOR_AVAILABLE:
+                plan, validation_report = validate_plan_against_metadata(plan, metadata)
+                print_validation_report(validation_report)
+                
+                if validation_report['is_valid']:
+                    print("✅ Plan validé et accepté")
+                    break
+                elif attempt == max_attempts:
+                    print(f"⚠️ Plan accepté malgré {validation_report['hallucinations_count']} hallucination(s)")
+                    break
+                else:
+                    print(f"❌ {validation_report['hallucinations_count']} hallucination(s), régénération...")
+                    continue
+            else:
+                break
+        
+        except Exception as e:
+            print(f"❌ Erreur : {e}")
+            if attempt == max_attempts:
+                print("❌ Échec, plan fallback")
+                return _generate_fallback_plan(metadata, writing_profile)
+            continue
+    
+    plan = _post_process_plan_for_profile(plan, writing_profile, metadata)
+    
+    return plan
+
+
+def _build_dynamic_prompt_with_rag(
+    metadata: Dict[str, Any],
+    study_context: Optional[Any] = None,
+    writing_profile: Optional[Union[str, 'WritingProfile']] = None
+) -> str:
+    """Construit prompt DYNAMIQUE avec contraintes RAG strictes"""
+    
+    profile_name = "academic"
+    profile_enum = None
+    
+    if writing_profile:
+        if isinstance(writing_profile, WritingProfile):
+            profile_name = writing_profile.value
+            profile_enum = writing_profile
+        elif isinstance(writing_profile, str):
+            profile_name = writing_profile.lower()
+            if PROFILES_AVAILABLE:
+                profile_map = {
+                    'academic': WritingProfile.ACADEMIC,
+                    'consultant': WritingProfile.CONSULTANT,
+                    'institutional': WritingProfile.INSTITUTIONAL
+                }
+                profile_enum = profile_map.get(profile_name)
+    
+    columns = metadata.get('columns', [])
+    num_rows = metadata['shape']['rows']
+    num_cols = metadata['shape']['columns']
+    
+    prompt = f"""
+Tu es un statisticien expert en analyse de données et rédaction de rapports.
+
+╔══════════════════════════════════════════════════════════════════════════════╗
+║ DONNÉES À ANALYSER                                                          ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+📊 VOLUME :
+- Lignes : {num_rows:,}
+- Colonnes : {num_cols}
+
+📋 COLONNES DISPONIBLES (LISTE EXHAUSTIVE) :
+
+"""
+    
+    if metadata.get('numeric_columns'):
+        prompt += f"🔢 Variables numériques ({len(metadata['numeric_columns'])}) :\n"
+        for col_name in metadata['numeric_columns'][:20]:
+            col = next((c for c in columns if c['name'] == col_name), None)
+            if col:
+                if col.get('is_encoded'):
+                    prompt += f"  • {col_name} [ENCODÉE - {col['nunique']} catégories]\n"
+                elif 'mean' in col:
+                    prompt += f"  • {col_name} (min: {col['min']:.2f}, max: {col['max']:.2f}, moy: {col['mean']:.2f})\n"
+    
+    if metadata.get('categorical_columns'):
+        prompt += f"\n📋 Variables catégorielles ({len(metadata['categorical_columns'])}) :\n"
+        for col_name in metadata['categorical_columns'][:20]:
+            col = next((c for c in columns if c['name'] == col_name), None)
+            if col:
+                top = list(col.get('top_values', {}).keys())[:3]
+                prompt += f"  • {col_name} ({col['nunique']} catégories, top: {', '.join(top)})\n"
+    
+    if metadata.get('encoded_columns'):
+        prompt += f"\n⚠️ Variables ENCODÉES : {', '.join(metadata['encoded_columns'][:15])}\n"
+    
+    if metadata.get('columns_with_missing'):
+        prompt += f"\n⚠️ Valeurs manquantes : {', '.join(metadata['columns_with_missing'][:15])}\n"
+    
+    if study_context and hasattr(study_context, 'to_prompt_context'):
+        prompt += f"""
+
+╔══════════════════════════════════════════════════════════════════════════════╗
+║ CONTEXTE DE L'ÉTUDE                                                         ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+{study_context.to_prompt_context()}
+"""
+    
+    if PROFILES_AVAILABLE and profile_enum:
+        style_block = get_writing_style_block(profile_enum)
+        prompt += f"\n{style_block}\n"
+    
+    # ═══════════════════════════════════════════════════════════
+    # CONTRAINTES RAG ANTI-HALLUCINATION
+    # ═══════════════════════════════════════════════════════════
+    
+    prompt += f"""
+
+╔══════════════════════════════════════════════════════════════════════════════╗
+║ 🔴 RÈGLES ANTI-HALLUCINATION (ULTRA-CRITIQUE)                              ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+COLONNES DISPONIBLES (LISTE COMPLÈTE) :
+
+🔢 Numériques : {', '.join(metadata['numeric_columns'])}
+
+📋 Catégorielles : {', '.join(metadata['categorical_columns'])}
+
+🔴 RÈGLES ABSOLUES :
+
+1. ✅ Utilise UNIQUEMENT les colonnes listées ci-dessus
+2. ❌ N'invente AUCUNE nouvelle colonne (satisfaction, NPS, conversion, rétention)
+3. ❌ N'invente AUCUNE statistique
+4. ⚠️ Si analyse nécessite colonne absente → SAUTE
+5. ⚠️ Vérifie 3 FOIS avant de mentionner une colonne
+
+❌ EXEMPLES HALLUCINATIONS À ÉVITER :
+
+- ❌ "Analyse satisfaction client" (si pas de colonne "satisfaction")
+- ❌ "Distribution NPS" (si pas de colonne "NPS")
+- ❌ "Taux conversion" (si pas de colonne "conversion")
+- ❌ "Corrélation satisfaction × rétention" (si colonnes absentes)
+
+✅ EXEMPLES CORRECTS :
+
+- ✅ "Distribution {metadata['numeric_columns'][0] if metadata.get('numeric_columns') else 'variable'}"
+- ✅ "Répartition {metadata['categorical_columns'][0] if metadata.get('categorical_columns') else 'catégorie'}"
+- ✅ "Corrélation {metadata['numeric_columns'][0] if len(metadata.get('numeric_columns', [])) > 0 else 'X'} × {metadata['numeric_columns'][1] if len(metadata.get('numeric_columns', [])) > 1 else 'Y'}"
+
+🔴 PÉNALITÉ : Hallucination = Plan REJETÉ et régénération
+
+Tu as {len(metadata['numeric_columns']) + len(metadata['categorical_columns'])} colonnes.
+C'est SUFFISANT. N'en invente AUCUNE autre !
+
+"""
+    
+    # ═══════════════════════════════════════════════════════════
+    # ⭐ INSTRUCTIONS PROFIL SPÉCIFIQUES
+    # ═══════════════════════════════════════════════════════════
+    
+    prompt += """
+
+╔══════════════════════════════════════════════════════════════════════════════╗
+║ RÈGLES STRUCTURELLES PAR PROFIL                                            ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+"""
+    
+    if profile_name == "academic":
+        prompt += """
+🎓 PROFIL ACADÉMIQUE (Recherche universitaire) :
+
+STRUCTURE OBLIGATOIRE : IMRAD (Introduction, Methods, Results, Discussion)
+
+1. **Introduction et Cadre Théorique**
+   - Contexte de recherche
+   - Revue de littérature
+   - ⭐ Hypothèses de départ (H1, H2, H3)
+   - Question de recherche
+   - Objectifs
+
+2. **Méthodologie (Methods)**
+   - Description données et collecte
+   - ⭐ Justification théorique des tests statistiques
+   - Outils d'analyse (avec pourquoi : tests de Pearson car...)
+   - Traitement valeurs manquantes
+   - ⭐ Limites méthodologiques anticipées
+
+3. **Résultats (Results)** - FAITS UNIQUEMENT
+   - Statistiques descriptives par variable
+   - Tests d'hypothèses (p-values)
+   - Corrélations
+   - ⚠️ PAS d'interprétation ici
+
+4. **Discussion** ⭐ OBLIGATOIRE
+   - Interprétation des résultats
+   - Lien avec littérature
+   - ⭐ Limites de l'étude
+   - Implications théoriques
+
+5. **Conclusion**
+   - Synthèse
+   - ⭐ Perspectives recherche futures
+   - Ouvertures
+
+"""
+    
+    elif profile_name == "consultant":
+        prompt += """
+💼 PROFIL CONSULTANT (Décision business) :
+
+STRUCTURE OBLIGATOIRE : Executive Summary + Analyses + Recommandations
+
+1. **Executive Summary** ⭐ EN PREMIER (OBLIGATOIRE)
+   
+   1.1. Contexte business
+   1.2. ⭐ Insights clés (3-5)
+        Format : "💡 [CHIFFRE] → [IMPLICATION BUSINESS]"
+   1.3. ⭐ Top 3 recommandations
+   1.4. Impacts quantifiés (ROI, €, %)
+
+2-4. **Analyses intermédiaires**
+   - Focus Top/Bottom performers
+   - Segmentation actionnable
+   - KPIs clés
+
+5. **Recommandations Stratégiques** ⭐ EN DERNIER (OBLIGATOIRE)
+   
+   5.1. Synthèse insights
+   
+   5.2. ⭐ Priorisation Impact × Effort
+        Matrice 2×2 :
+        - 🟢 QUICK WINS (High Impact / Low Effort)
+        - 🟡 Projets stratégiques (High Impact / High Effort)
+        - ⚪ Low priority
+   
+   5.3. ⭐ Plan mise en œuvre
+        - Court terme (0-3 mois)
+        - Moyen terme (3-12 mois)
+   
+   5.4. ⭐ KPIs de suivi par recommandation
+
+"""
+    
+    elif profile_name == "institutional":
+        # ✅ Générer exemples DYNAMIQUES basés sur vraies colonnes
+        example_numeric = metadata['numeric_columns'][0] if metadata.get('numeric_columns') else 'Indicateur_A'
+        example_numeric_2 = metadata['numeric_columns'][1] if len(metadata.get('numeric_columns', [])) > 1 else 'Indicateur_B'
+        example_categorical = metadata['categorical_columns'][0] if metadata.get('categorical_columns') else 'Variable_X'
+        
+        # Détecter thématique données (entreprises, ménages, étudiants, etc.)
+        data_theme = "unités observées"
+        all_cols_text = ' '.join([c.lower() for c in metadata.get('columns_names', [])])
+        if 'entreprise' in all_cols_text or 'promoteur' in all_cols_text or 'ca' in all_cols_text:
+            data_theme = "entreprises"
+        elif 'ménage' in all_cols_text or 'famille' in all_cols_text:
+            data_theme = "ménages"
+        elif 'étudiant' in all_cols_text or 'élève' in all_cols_text:
+            data_theme = "étudiants"
+        elif 'patient' in all_cols_text or 'santé' in all_cols_text:
+            data_theme = "patients"
+        
+        prompt += f"""
+🏛️ PROFIL INSTITUTIONAL (INS / Ministères / Rapports statistiques officiels) :
+
+⭐ APPROCHE : Analyse EXPLORATOIRE statistique à haut niveau
+Focus : INDICATEURS + INSIGHTS + Exploration progressive
+
+📊 VOS DONNÉES : {num_rows:,} {data_theme}, {len(metadata['numeric_columns'])} indicateurs numériques, {len(metadata['categorical_columns'])} variables catégorielles
+
+STRUCTURE RECOMMANDÉE (⚠️ ADAPTER LES TITRES À VOS DONNÉES) :
+
+1. **Contexte et Objectifs** (exemple de titre adapté à vos données)
+   
+   ✅ BON : "Contexte de l'analyse des {data_theme}"
+   ✅ BON : "Objectifs de l'étude sur les {data_theme}"
+   ❌ MAUVAIS : "Cadre réglementaire" (trop administratif)
+
+2. **Présentation Données et Indicateurs** (titre adaptatif)
+   
+   ✅ BON : "Présentation des {num_rows:,} {data_theme} et {len(metadata['numeric_columns']) + len(metadata['categorical_columns'])} indicateurs"
+   ✅ BON : "Vue d'ensemble des données collectées"
+   
+   Contenu :
+   - Volume : {num_rows:,} {data_theme} observées
+   - Indicateurs clés disponibles
+   - Qualité et complétude
+
+3. **Analyse UNIVARIÉE** ⭐ OBLIGATOIRE (titres avec VRAIS noms colonnes)
+   
+   ✅ EXEMPLES ADAPTÉS À VOS DONNÉES :
+   
+   Section : "Analyse de l'indicateur {example_numeric}"
+   Analyses :
+   - "Distribution de {example_numeric}"
+   - "Statistiques descriptives : moyenne, médiane, dispersion"
+   - "Identification des valeurs atypiques"
+   
+   Section : "Répartition par {example_categorical}"
+   Analyses :
+   - "Effectifs et proportions par modalité de {example_categorical}"
+   - "Modalités dominantes"
+   
+   ⚠️ Créer UNE section par indicateur clé (au moins top 5-10)
+
+4. **Analyse BIVARIÉE** ⭐ OBLIGATOIRE (relations entre VRAIES variables)
+   
+   ✅ EXEMPLES ADAPTÉS À VOS DONNÉES :
+   
+   Section : "Relations entre {example_numeric} et {example_numeric_2}"
+   Analyses :
+   - "Corrélation entre {example_numeric} et {example_numeric_2}"
+   - "Analyse de la relation"
+   
+   Section : "Analyse croisée : {example_categorical} × indicateurs"
+   Analyses :
+   - "Comparaison des indicateurs selon {example_categorical}"
+   - "Disparités entre modalités"
+   
+   ⚠️ Utiliser NOMS EXACTS des colonnes
+
+5. **Analyse MULTIVARIÉE** (si >3 variables, optionnel)
+   
+   ✅ EXEMPLES :
+   - "Segmentation des {data_theme} : profils types"
+   - "Facteurs explicatifs de [indicateur cible]"
+   - "Vue synthétique multi-indicateurs"
+
+6. **Synthèse des INSIGHTS** ⭐ OBLIGATOIRE
+   
+   ✅ BON : "Synthèse des observations statistiques sur les {data_theme}"
+   ✅ BON : "Faits marquants et tendances identifiées"
+   
+   Contenu :
+   - 📊 Faits marquants par indicateur
+   - 📊 Tendances principales observées
+   - ⚠️ Disparités et hétérogénéités
+   - ⚠️ Points d'attention méthodologiques
+
+🎯 RÈGLES TITRES INSTITUTIONAL :
+
+✅ TITRES ADAPTATIFS (s'adapter aux données) :
+- Utiliser NOMS RÉELS colonnes : "{example_numeric}", "{example_categorical}"
+- Utiliser thématique données : "{data_theme}"
+- Être SPÉCIFIQUE : "Distribution {example_numeric}" pas "Distribution variable"
+
+❌ TITRES GÉNÉRIQUES (à éviter) :
+- "Analyse univariée" → trop vague
+- "Variable X" → utiliser vrai nom
+- "Indicateur 1" → utiliser vrai nom
+
+📝 STYLE RÉDACTION :
+
+✅ À FAIRE :
+- Vocabulaire accessible : "répartition", "proportion", "effectif"
+- Observations factuelles : "Les données révèlent que..."
+- Focus INDICATEURS et INSIGHTS
+- Progression : univarié → bivarié → multivarié
+
+❌ À ÉVITER :
+- Recommandations : "Il faut...", "Nous recommandons..."
+- Jargon : "hétéroscédasticité", "kurtosis"
+- Interprétations subjectives
+"""
+    
+    # Format JSON
+    prompt += f"""
+
+╔══════════════════════════════════════════════════════════════════════════════╗
+║ FORMAT JSON REQUIS                                                          ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+{{
+  "titre": "Titre adapté aux données",
+  "date": "{datetime.now().strftime('%Y-%m-%d')}",
+  "auteur": "AI Statistical Reporter",
+  "profil": "{profile_name}",
+  "chapitres": [
+    {{
+      "numero": "1",
+      "titre": "Titre avec NOM COLONNE réelle",
+      "sections": [
+        {{
+          "titre": "Section SPÉCIFIQUE (colonne réelle)",
+          "analyses": ["Analyse avec NOM VARIABLE réel"]
+        }}
+      ]
+    }}
+  ]
+}}
+
+⚠️ RAPPELS :
+1. Utilise NOMS EXACTS colonnes
+2. N'invente RIEN
+3. Adapte structure au profil {profile_name.upper()}
+
+🚀 GÉNÈRE LE PLAN JSON.
+"""
+    
+    return prompt
+
+
+def _post_process_plan_for_profile(
+    plan: Dict[str, Any],
+    writing_profile: Optional[Union[str, 'WritingProfile']],
+    metadata: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Post-traitement selon profil"""
+    
+    profile_name = "academic"
+    if writing_profile:
+        if isinstance(writing_profile, WritingProfile):
+            profile_name = writing_profile.value
+        elif isinstance(writing_profile, str):
+            profile_name = writing_profile.lower()
+    
+    plan['profil'] = profile_name
+    
+    # Academic : Discussion (titre adaptatif)
+    if profile_name == "academic":
+        titles = [c['titre'].lower() for c in plan.get('chapitres', [])]
+        if not any('discussion' in t for t in titles):
+            # Détecter thématique pour titre adaptatif
+            data_theme_subject = "résultats"
+            if any('entreprise' in str(metadata.get('columns_names', [])).lower()):
+                data_theme_subject = "entreprises étudiées"
+            elif any('ménage' in str(metadata.get('columns_names', [])).lower()):
+                data_theme_subject = "ménages analysés"
+            
+            plan['chapitres'].append({
+                'numero': str(len(plan['chapitres']) + 1),
+                'titre': f'Discussion et Limites de l\'Étude',
+                'sections': [{
+                    'titre': f'Interprétation des {data_theme_subject}',
+                    'analyses': [
+                        'Interprétation des résultats au regard de la littérature', 
+                        'Limites méthodologiques de l\'étude', 
+                        'Perspectives de recherche futures'
+                    ]
+                }]
+            })
+    
+    # Consultant : Exec Summary + Recommandations
+    elif profile_name == "consultant":
+        first = plan['chapitres'][0] if plan.get('chapitres') else None
+        if not first or 'executive' not in first['titre'].lower():
+            plan['chapitres'].insert(0, {
+                'numero': '1',
+                'titre': 'Executive Summary',
+                'sections': [{
+                    'titre': 'Insights clés et recommandations',
+                    'analyses': ['💡 Insights majeurs', '🎯 Top 3 recommandations', '💰 Impacts quantifiés']
+                }]
+            })
+        
+        last = plan['chapitres'][-1]
+        if 'recommandation' not in last['titre'].lower():
+            plan['chapitres'].append({
+                'numero': str(len(plan['chapitres']) + 1),
+                'titre': 'Recommandations Stratégiques',
+                'sections': [
+                    {'titre': 'Priorisation Impact × Effort', 'analyses': ['🟢 Quick wins', '🟡 Projets stratégiques']},
+                    {'titre': 'Plan de mise en œuvre', 'analyses': ['Court terme (0-3 mois)', 'Moyen terme (3-12 mois)']},
+                    {'titre': 'KPIs de suivi', 'analyses': ['Indicateurs de performance']}
+                ]
+            })
+    
+    # ═══════════════════════════════════════════════════════════
+    # ⭐ INSTITUTIONAL : Approche INS/Ministères CORRIGÉE
+    # ═══════════════════════════════════════════════════════════
+    
+    elif profile_name == "institutional":
+        # ✅ NE PAS FIGER LES TITRES - Vérifier juste structure
+        titles = [c['titre'].lower() for c in plan.get('chapitres', [])]
+        
+        # Vérifier présence structure exploratoire (sans forcer titres exacts)
+        has_univariate = any(
+            'univar' in t or 'indicateur' in t or 'descriptive' in t or 'exploration' in t 
+            for t in titles
+        )
+        has_bivariate = any(
+            'bivar' in t or 'croisé' in t or 'relation' in t or 'corrélation' in t
+            for t in titles
+        )
+        has_insights = any(
+            'insight' in t or 'synthèse' in t or 'conclusion' in t or 'marquant' in t
+            for t in titles
+        )
+        
+        # ⚠️ SEULEMENT ajouter chapitres MANQUANTS (pas tout reconstruire)
+        
+        # Si manque univariée, ajouter APRÈS intro
+        if not has_univariate and len(plan.get('chapitres', [])) >= 2:
+            # Insérer après les 2 premiers chapitres (contexte + données)
+            insert_pos = 2
+            plan['chapitres'].insert(insert_pos, {
+                'numero': str(insert_pos + 1),
+                'titre': f'Analyse Exploratoire des {len(metadata["numeric_columns"]) + len(metadata["categorical_columns"])} Indicateurs',
+                'sections': [
+                    {
+                        'titre': f'Distributions et statistiques descriptives',
+                        'analyses': [
+                            f'Analyses univariées de chaque indicateur',
+                            'Tendances centrales et dispersions',
+                            'Identification des valeurs atypiques'
+                        ]
+                    }
+                ]
+            })
+        
+        # Si manque bivariée, ajouter AVANT synthèse
+        if not has_bivariate and len(plan.get('chapitres', [])) >= 3:
+            # Insérer avant dernier chapitre
+            insert_pos = len(plan['chapitres']) - 1
+            plan['chapitres'].insert(insert_pos, {
+                'numero': str(insert_pos + 1),
+                'titre': 'Relations entre Indicateurs',
+                'sections': [
+                    {
+                        'titre': 'Corrélations et croisements statistiques',
+                        'analyses': [
+                            'Corrélations entre variables numériques',
+                            'Croisements variables catégorielles × numériques',
+                            'Identification relations significatives'
+                        ]
+                    }
+                ]
+            })
+        
+        # Si manque synthèse, ajouter EN FIN
+        if not has_insights:
+            plan['chapitres'].append({
+                'numero': str(len(plan['chapitres']) + 1),
+                'titre': 'Synthèse des Observations Statistiques',
+                'sections': [{
+                    'titre': 'Faits marquants et tendances',
+                    'analyses': [
+                        'Principales observations statistiques',
+                        'Disparités et hétérogénéités identifiées',
+                        'Points d\'attention méthodologiques'
+                    ]
+                }]
+            })
+    
+    # Renuméroter
+    for i, chap in enumerate(plan.get('chapitres', []), 1):
+        chap['numero'] = str(i)
+    
+    return plan
+
+
+def _generate_fallback_plan(
+    metadata: Dict[str, Any],
+    writing_profile: Optional[Union[str, 'WritingProfile']]
+) -> Dict[str, Any]:
+    """Plan de secours"""
+    
+    profile_name = "academic"
+    if writing_profile:
+        if isinstance(writing_profile, WritingProfile):
+            profile_name = writing_profile.value
+        elif isinstance(writing_profile, str):
+            profile_name = writing_profile.lower()
+    
+    return {
+        "titre": "Rapport Statistique",
+        "date": datetime.now().strftime("%Y-%m-%d"),
+        "auteur": "AI Statistical Reporter",
+        "profil": profile_name,
+        "chapitres": [
+            {"numero": "1", "titre": "Introduction", "sections": [{"titre": "Contexte", "analyses": [f"{metadata['shape']['rows']:,} observations"]}]},
+            {"numero": "2", "titre": "Méthodologie", "sections": [{"titre": "Outils", "analyses": ["Statistiques descriptives"]}]},
+            {"numero": "3", "titre": "Analyse", "sections": [{"titre": "Résultats", "analyses": ["Analyse descriptive"]}]},
+            {"numero": "4", "titre": "Conclusions", "sections": [{"titre": "Synthèse", "analyses": ["Résumé"]}]}
+        ]
+    }
+
+
+if __name__ == "__main__":
+    """Tests"""
+    
+    print("="*70)
+    print("TEST - WEEK2 RAG (VERSION INS CORRIGÉE)")
+    print("="*70)
+    
+    print("\n✅ RAG Features:")
+    print("  - Métadonnées enrichies")
+    print("  - Contraintes anti-hallucination")
+    print(f"  - Validation : {RAG_VALIDATOR_AVAILABLE}")
+    print(f"  - Profils : {PROFILES_AVAILABLE}")
+    print("  ⭐ INSTITUTIONAL = Approche INS/Ministères (exploratoire)")
+    
+    try:
+        import pandas as pd
+        test_data = {
+            'Age': [25, 30, 35],
+            'CA_2015': [10000, 25000, 50000],
+            'Region': ['LITTORAL', 'CENTRE', 'LITTORAL']
+        }
+        df = pd.DataFrame(test_data)
+        df.to_csv('test.csv', index=False)
+        
+        metadata = analyze_csv('test.csv')
+        print(f"\n✅ Analyse: {len(metadata['columns'])} colonnes")
+    
+    except Exception as e:
+        print(f"\n❌ Erreur: {e}")
+    
+    print("\n" + "="*70)
