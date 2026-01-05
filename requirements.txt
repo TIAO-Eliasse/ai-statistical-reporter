@@ -27,6 +27,7 @@ langgraph-checkpoint
 langgraph-prebuilt
 langgraph-sdk
 langsmith
+chainlit
 
 # === Utils ===
 pydantic
@@ -48,3 +49,4 @@ gunicorn
 watchdog
 boto3
 botocore
+
