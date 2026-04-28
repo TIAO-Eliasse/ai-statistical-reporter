@@ -1,0 +1,386 @@
+"""
+Gestionnaire de sessions E2B avec persistance
+VERSION CORRIGÉE - Janvier 2026
+[OK] Chargement correct de E2B_API_KEY
+[OK] Gestion robuste des erreurs
+"""
+
+import os
+import time
+import threading
+import logging
+from datetime import datetime, timedelta
+from typing import Dict, Optional
+from e2b_code_interpreter import Sandbox
+from dotenv import load_dotenv
+
+# [OK] CHARGEMENT DES VARIABLES D'ENVIRONNEMENT
+load_dotenv()
+
+# Configuration du logger
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+
+class E2BSessionManager:
+    """Gestionnaire centralisé des sessions E2B"""
+    
+    def __init__(self):
+        self.sessions: Dict[str, Dict] = {}
+        self.lock = threading.Lock()
+        self.max_idle_time = timedelta(minutes=30)
+        self._heartbeat_enabled = False
+        
+        # [OK] VÉRIFICATION CLÉ API AU DÉMARRAGE
+        self.api_key = os.getenv("E2B_API_KEY")
+        
+        if not self.api_key:
+            logger.error("=" * 60)
+            logger.error("[ERROR] ERREUR CRITIQUE : E2B_API_KEY non trouvée !")
+            logger.error("=" * 60)
+            logger.error("Solution :")
+            logger.error("1. Créez un fichier .env à la racine du projet")
+            logger.error("2. Ajoutez : E2B_API_KEY=votre_clé_ici")
+            logger.error("3. Vérifiez que python-dotenv est installé")
+            logger.error("=" * 60)
+            raise ValueError("E2B_API_KEY manquante dans les variables d'environnement")
+        
+        logger.info(f"[OK] E2B Session Manager initialized")
+        logger.info(f"   Clé API : {self.api_key[:10]}...{self.api_key[-5:]}")
+        logger.info(f"   Heartbeat : désactivé")
+    
+    def get_sandbox_for_user(self, user_id: str) -> Sandbox:
+        """
+        Récupère ou crée une sandbox pour un utilisateur
+        
+        Args:
+            user_id: ID de l'utilisateur
+        
+        Returns:
+            Instance de Sandbox E2B
+        """
+        with self.lock:
+            # Si session existe et est active, la réutiliser
+            if user_id in self.sessions:
+                session_info = self.sessions[user_id]
+                
+                # Vérifier si la session n'est pas expirée
+                idle_time = datetime.now() - session_info['last_used']
+                if idle_time > self.max_idle_time:
+                    logger.warning(f"Session expirée pour {user_id}, recréation...")
+                    self._cleanup_session(user_id)
+                else:
+                    session_info['last_used'] = datetime.now()
+                    logger.debug(f"Réutilisation sandbox pour {user_id}")
+                    return session_info['sandbox']
+            
+            # Créer nouvelle session
+            logger.info(f"Création nouvelle sandbox pour {user_id}")
+            
+            try:
+                # [OK] CORRECTION CRITIQUE : Passer la clé API
+                sandbox = Sandbox.create(
+                    api_key=self.api_key,  # ← LIGNE CRITIQUE AJOUTÉE
+                    timeout=1800  # 30 minutes
+                )
+                
+                self.sessions[user_id] = {
+                    'sandbox': sandbox,
+                    'created_at': datetime.now(),
+                    'last_used': datetime.now(),
+                    'heartbeat_count': 0
+                }
+                
+                logger.info(f"[OK] Sandbox créé pour {user_id}: {sandbox.sandbox_id}")
+                return sandbox
+            
+            except Exception as e:
+                logger.error(f"[ERROR] Échec création sandbox pour {user_id}: {e}")
+                logger.error(f"   Clé API utilisée : {self.api_key[:10]}...")
+                raise
+    
+    def cleanup_session(self, user_id: str):
+        """Nettoie une session utilisateur"""
+        with self.lock:
+            if user_id in self.sessions:
+                self._cleanup_session(user_id)
+    
+    def get_session_info(self, user_id: str) -> Optional[Dict]:
+        """Récupère les informations d'une session"""
+        with self.lock:
+            if user_id not in self.sessions:
+                return None
+            
+            session_info = self.sessions[user_id]
+            
+            return {
+                'sandbox_id': session_info['sandbox'].sandbox_id,
+                'created_at': session_info['created_at'].isoformat(),
+                'last_used': session_info['last_used'].isoformat(),
+                'idle_time': (datetime.now() - session_info['last_used']).total_seconds(),
+                'heartbeat_count': session_info['heartbeat_count'],
+            }
+    
+    def _cleanup_session(self, user_id: str):
+        """Nettoie une session (doit être appelé avec le lock)"""
+        if user_id in self.sessions:
+            session_info = self.sessions[user_id]
+            
+            try:
+                sandbox = session_info['sandbox']
+                sandbox.kill()
+                logger.info(f"Sandbox fermé pour {user_id}")
+            except Exception as e:
+                logger.error(f"Erreur fermeture sandbox pour {user_id}: {e}")
+            
+            del self.sessions[user_id]
+    
+    def cleanup_all(self):
+        """Nettoie toutes les sessions"""
+        logger.info("Nettoyage de toutes les sessions...")
+        
+        with self.lock:
+            for user_id in list(self.sessions.keys()):
+                self._cleanup_session(user_id)
+        
+        logger.info("Toutes les sessions nettoyées")
+    
+    def __del__(self):
+        """Nettoyage à la destruction de l'objet"""
+        self.cleanup_all()
+
+
+# Instance globale du gestionnaire
+_session_manager = None
+
+
+def get_session_manager() -> E2BSessionManager:
+    """Récupère l'instance globale du gestionnaire"""
+    global _session_manager
+    
+    if _session_manager is None:
+        _session_manager = E2BSessionManager()
+    
+    return _session_manager
+
+
+def get_sandbox_for_user(user_id: str) -> Sandbox:
+    """Helper function pour récupérer une sandbox"""
+    return get_session_manager().get_sandbox_for_user(user_id)
+
+
+def execute_python_code(user_id: str, code: str) -> Dict:
+    """
+    Exécute le code et retourne les résultats formatés
+    
+    Returns:
+        {
+            'success': bool,
+            'output': str,
+            'charts': List[str],
+            'error': str,
+            'execution_time': float
+        }
+    """
+    start_time = time.time()
+    
+    try:
+        sandbox = get_sandbox_for_user(user_id)
+        
+        logger.info(f"Exécution code pour {user_id} ({len(code)} chars)")
+        logger.debug(f"Code : {code[:100]}...")
+        
+        # Exécution du code
+        execution = sandbox.run_code(code)
+        
+        execution_time = time.time() - start_time
+        
+        # [OK] Gestion des erreurs Python (IndentationError, SyntaxError, etc.)
+        if execution.error:
+            error_msg = f"{execution.error.name}: {execution.error.value}"
+            
+            # Ajouter traceback si disponible
+            if hasattr(execution.error, 'traceback') and execution.error.traceback:
+                error_msg += f"\n{execution.error.traceback}"
+            
+            logger.error(f"Erreur d'exécution : {error_msg}")
+            
+            return {
+                'success': False,
+                'output': '',
+                'charts': [],
+                'error': error_msg,
+                'execution_time': execution_time
+            }
+        
+        # [OK] Collecte du texte (stdout)
+        output_text = ""
+        if execution.logs and execution.logs.stdout:
+            output_text = "\n".join(execution.logs.stdout)
+            logger.info(f"Output capturé : {len(output_text)} chars")
+        
+        # [OK] Collecte des graphiques (PNG base64)
+        charts = []
+        if execution.results:
+            for result in execution.results:
+                if hasattr(result, 'png') and result.png:
+                    charts.append(result.png)
+                    logger.info(f"Graphique capturé")
+        
+        logger.info(f"[OK] Exécution réussie en {execution_time:.2f}s - "
+                   f"{len(output_text)} chars, {len(charts)} graphiques")
+        
+        return {
+            'success': True,
+            'output': output_text.strip(),
+            'charts': charts,
+            'error': None,
+            'execution_time': execution_time
+        }
+    
+    except Exception as e:
+        execution_time = time.time() - start_time
+        logger.error(f"[ERROR] Erreur lors de l'exécution : {e}")
+        
+        import traceback
+        logger.error(f"Traceback :\n{traceback.format_exc()}")
+        
+        return {
+            'success': False,
+            'output': '',
+            'charts': [],
+            'error': str(e),
+            'execution_time': execution_time
+        }
+
+
+def cleanup_user_session(user_id: str):
+    """Nettoie la session d'un utilisateur"""
+    get_session_manager().cleanup_session(user_id)
+
+
+def get_user_session_info(user_id: str) -> Optional[Dict]:
+    """Récupère les infos de session d'un utilisateur"""
+    return get_session_manager().get_session_info(user_id)
+
+
+def display_session_status_in_streamlit():
+    """Affiche le statut de la session E2B dans Streamlit"""
+    try:
+        import streamlit as st
+    except ImportError:
+        return
+    
+    if 'user_id' not in st.session_state:
+        return
+    
+    user_id = st.session_state.user_id
+    session_info = get_user_session_info(user_id)
+    
+    if session_info:
+        with st.expander("🖥️ Session E2B", expanded=False):
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                st.caption(f"**Sandbox ID:** {session_info['sandbox_id'][:12]}...")
+                st.caption(f"**Créée:** {session_info['created_at'][:19]}")
+            
+            with col2:
+                st.caption(f"**Dernière utilisation:** {session_info['last_used'][:19]}")
+                st.caption(f"**Inactivité:** {int(session_info['idle_time'])}s")
+            
+            # Barre de progression du timeout (30 min = 1800s)
+            timeout_progress = min(100, (session_info['idle_time'] / 1800) * 100)
+            st.progress(timeout_progress / 100)
+            
+            if timeout_progress > 80:
+                st.warning("[WARNING] Session proche de l'expiration")
+
+
+# Export pour compatibilité
+session_manager = get_session_manager()
+
+# Nettoyage à la sortie
+import atexit
+atexit.register(lambda: get_session_manager().cleanup_all())
+
+
+# ============================================
+# TEST
+# ============================================
+
+if __name__ == "__main__":
+    print("=" * 60)
+    print("TEST E2B SESSION MANAGER")
+    print("=" * 60)
+    
+    # Test 1 : Vérification clé API
+    print("\n📝 Test 1 : Vérification clé API")
+    api_key = os.getenv("E2B_API_KEY")
+    
+    if not api_key:
+        print("[ERROR] E2B_API_KEY non trouvée")
+        print("\nVérifiez votre fichier .env :")
+        print("1. Doit contenir : E2B_API_KEY=votre_clé")
+        print("2. Doit être à la racine du projet")
+        print("3. python-dotenv doit être installé")
+        exit(1)
+    
+    print(f"[OK] E2B_API_KEY trouvée : {api_key[:10]}...{api_key[-5:]}")
+    
+    # Test 2 : Création sandbox
+    print("\n📝 Test 2 : Création sandbox")
+    try:
+        sandbox = get_sandbox_for_user("test_user")
+        print(f"[OK] Sandbox créé : {sandbox.sandbox_id}")
+    except Exception as e:
+        print(f"[ERROR] Échec : {e}")
+        exit(1)
+    
+    # Test 3 : Exécution code simple
+    print("\n📝 Test 3 : Exécution code simple")
+    result = execute_python_code("test_user", "print('Hello from E2B!')")
+    
+    if result['success']:
+        print(f"[OK] Succès")
+        print(f"   Output : {result['output']}")
+        print(f"   Temps : {result['execution_time']:.2f}s")
+    else:
+        print(f"[ERROR] Échec : {result['error']}")
+    
+    # Test 4 : Exécution avec graphique
+    print("\n📝 Test 4 : Exécution avec graphique")
+    code_graph = """
+import matplotlib.pyplot as plt
+import numpy as np
+
+x = np.linspace(0, 10, 100)
+y = np.sin(x)
+
+plt.figure(figsize=(10, 6))
+plt.plot(x, y)
+plt.title("Test Graphique")
+plt.show()
+
+print("Graphique généré")
+"""
+    
+    result = execute_python_code("test_user", code_graph)
+    
+    if result['success']:
+        print(f"[OK] Succès")
+        print(f"   Output : {result['output']}")
+        print(f"   Charts : {len(result['charts'])} graphique(s)")
+        print(f"   Temps : {result['execution_time']:.2f}s")
+    else:
+        print(f"[ERROR] Échec : {result['error']}")
+    
+    # Cleanup
+    cleanup_user_session("test_user")
+    
+    print("\n" + "=" * 60)
+    print("[OK] TOUS LES TESTS RÉUSSIS")
+    print("=" * 60)
